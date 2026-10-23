@@ -106,7 +106,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
-import { useStepUp, isStepUpCancelled } from '@/composables/useStepUp'
+import { useStepUp, isStepUpCancelled, StepUpCancelledError } from '@/composables/useStepUp'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime } from '@/utils/format'
 import * as api from '@/api/admin/mcp'
@@ -120,9 +120,11 @@ import { permissionPresets } from './permissions'
 // their existing permission selection for deliberate review before replacement.
 //
 // Closing the dialog or changing its request or account cancels pending reads.
-// A decision response can navigate only while its request and administrator are
-// still current. Failed submissions retain the selected permissions, and local
-// expiry disables submission until the client starts a new authorization flow.
+// Each decision attempt and response requires the same active review and
+// administrator, so a late challenge cannot reopen verification for a replaced
+// request. Callback navigation requires that same context. Failed submissions
+// retain the selected permissions, and local expiry disables submission until the
+// client starts a new authorization flow.
 
 // Browser identity and shared verification UI belong to this mounted consent dialog.
 const props = defineProps<{
@@ -211,30 +213,55 @@ async function load() {
 // TOTP verification retries the same session-bound request. Failures retain the
 // draft, and account changes prevent an old callback from navigating the new session.
 // The administrator and review are captured before submission, then checked again
-// after verification and the API call. The returned URL must match the reviewed
-// callback origin and path before navigation; a changed dialog or request leaves
-// the response unused. Concurrent submissions are ignored until the pending one ends.
+// before each API attempt and before exposing its result or failure to TOTP.
+// The returned URL must match the reviewed callback origin and path before
+// navigation; a changed dialog or request leaves the response unused. Concurrent
+// submissions are ignored until the pending one ends.
 async function decide(approve: boolean) {
   const current = review.value
   const userID = auth.user?.id
+  const requestController = controller
   if (!current || expired.value || submitting.value || (approve && !selected.value.size)) return
   submitting.value = true
   error.value = ''
   const permissions = [...selected.value]
-  try {
-    const target = await stepUp.run(() =>
-      api.decideOAuthRequest(current.request.id, current.nonce, approve, permissions),
+  const requestID = current.request.id
+  // isCurrent ties retries to the reviewed request, account, and visibility.
+  // The read controller remains aborted after closing or replacing a review,
+  // including transitions that later return to the same request identifier.
+  function isCurrent(): boolean {
+    return (
+      !disposed &&
+      props.show &&
+      props.requestId === requestID &&
+      review.value === current &&
+      auth.user?.id === userID &&
+      !!requestController &&
+      !requestController.signal.aborted
     )
+  }
+  try {
+    const target = await stepUp.run(async () => {
+      if (!isCurrent()) throw new StepUpCancelledError()
+      try {
+        const result = await api.decideOAuthRequest(
+          current.request.id,
+          current.nonce,
+          approve,
+          permissions,
+        )
+        if (!isCurrent()) throw new StepUpCancelledError()
+        return result
+      } catch (cause) {
+        // Check failures before useStepUp classifies them: a delayed challenge
+        // for an abandoned review must not open a prompt or retry its decision.
+        if (!isCurrent()) throw new StepUpCancelledError()
+        throw cause
+      }
+    })
     // A completed decision belongs to the original administrator and request;
     // leaving this workflow must prevent its callback from replacing the current page.
-    if (
-      disposed ||
-      !props.show ||
-      props.requestId !== current.request.id ||
-      review.value !== current ||
-      auth.user?.id !== userID
-    )
-      return
+    if (!isCurrent()) return
     const expected = new URL(current.redirect_uri)
     const callback = new URL(target)
     if (
@@ -245,14 +272,7 @@ async function decide(approve: boolean) {
       throw new Error(t('admin.mcp.oauth.callbackInvalid'))
     window.location.assign(callback.href)
   } catch (cause) {
-    if (
-      !disposed &&
-      props.show &&
-      review.value === current &&
-      auth.user?.id === userID &&
-      !isStepUpCancelled(cause)
-    )
-      error.value = messageOf(cause)
+    if (isCurrent() && !isStepUpCancelled(cause)) error.value = messageOf(cause)
   } finally {
     submitting.value = false
   }

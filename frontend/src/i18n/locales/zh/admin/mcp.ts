@@ -118,6 +118,7 @@ export default {
     never: '不过期',
     lastUsed: '最近使用',
     unused: '尚未使用',
+    disabled: '已停用',
     active: '已启用',
     expired: '已过期',
     revoked: '已撤销',

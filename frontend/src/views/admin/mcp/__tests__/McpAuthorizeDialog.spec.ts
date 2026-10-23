@@ -1,6 +1,9 @@
 import { mount, flushPromises } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import McpAuthorizeDialog from '../McpAuthorizeDialog.vue'
+import { reactive } from 'vue'
+import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
+import type { StepUpController } from '@/composables/useStepUp'
 
 // McpAuthorizeDialog.spec.ts exercises consent defaults, explicit submission, and
 // failed-decision recovery. Browser navigation is avoided by failed API fixtures;
@@ -10,16 +13,15 @@ import McpAuthorizeDialog from '../McpAuthorizeDialog.vue'
 const api = vi.hoisted(() => ({ getOAuthReview: vi.fn(), decideOAuthRequest: vi.fn() }))
 vi.mock('@/api/admin/mcp', () => api)
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({ user: { id: 1, email: 'admin@example.invalid' } }),
+  useAuthStore: () => auth,
 }))
 vi.mock('vue-i18n', async (importOriginal) => ({
   ...(await importOriginal<typeof import('vue-i18n')>()),
   useI18n: () => ({ t: (key: string) => key, te: () => false, locale: { value: 'en' } }),
 }))
-vi.mock('@/composables/useStepUp', () => ({
-  useStepUp: () => ({ run: (action: () => Promise<unknown>) => action(), onCancel: vi.fn() }),
-  isStepUpCancelled: () => false,
-}))
+
+// Reactive account state reproduces login changes while the existing consent remains mounted.
+const auth = reactive({ user: { id: 1, email: 'admin@example.invalid' } })
 
 // review creates a live request with routine reads, writes, and sensitive reads.
 function review() {
@@ -70,7 +72,7 @@ function page() {
           template:
             '<section v-if="show" role="dialog"><h2>{{ title }}</h2><button data-test="dismiss" @click="$emit(\'close\')">Close</button><slot/><footer><slot name="footer"/></footer></section>',
         },
-        TotpStepUpDialog: true,
+        TotpStepUpDialog: { name: 'TotpStepUpDialog', props: ['controller'], template: '<div />' },
         Icon: true,
         Select: true,
       },
@@ -80,8 +82,138 @@ function page() {
 
 describe('MCP application consent', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
+    auth.user = { id: 1, email: 'admin@example.invalid' }
     api.getOAuthReview.mockResolvedValue(review())
+  })
+
+  // The first decision reports a verification requirement after its review context changes.
+  // Each lifecycle transition must suppress the obsolete prompt and leave the old request unretried.
+  it.each(['request', 'account', 'hidden', 'unmount'] as const)(
+    'discards a delayed challenge after %s changes',
+    async (change) => {
+      let rejectDecision!: (error: unknown) => void
+      api.decideOAuthRequest.mockImplementationOnce(
+        () => new Promise((_resolve, reject) => (rejectDecision = reject)),
+      )
+      const wrapper = page()
+      await flushPromises()
+      const controller = wrapper
+        .getComponent({ name: 'TotpStepUpDialog' })
+        .props('controller') as StepUpController
+      await wrapper
+        .findAll('button')
+        .find((button) => button.text() === 'admin.mcp.oauth.authorize')!
+        .trigger('click')
+      if (change === 'request') {
+        const nextReview = review()
+        nextReview.request.id = 'request-two'
+        api.getOAuthReview.mockResolvedValue(nextReview)
+        await wrapper.setProps({ requestId: 'request-two' })
+      } else if (change === 'account') auth.user = { id: 2, email: 'second@example.invalid' }
+      else if (change === 'hidden') await wrapper.setProps({ show: false })
+      else wrapper.unmount()
+      await flushPromises()
+      rejectDecision({ code: 'STEP_UP_REQUIRED' })
+      await flushPromises()
+      expect(controller.visible.value).toBe(false)
+      controller.onVerified()
+      await flushPromises()
+      expect(api.decideOAuthRequest).toHaveBeenCalledTimes(1)
+      if (change !== 'unmount') {
+        expect(wrapper.text()).not.toContain('step-up verification cancelled by user')
+        wrapper.unmount()
+      }
+    },
+  )
+
+  // Router history can replace the query while Vue retains the same consent instance.
+  // This harness tests that routing interleaving; it does not establish a cross-account server authorization outcome.
+  it('ignores an old challenge after router history changes the request', async () => {
+    api.getOAuthReview.mockImplementation(async (id: string) => ({
+      ...review(),
+      request: { ...review().request, id },
+    }))
+    let rejectDecision!: (error: unknown) => void
+    api.decideOAuthRequest.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectDecision = reject)),
+    )
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        {
+          path: '/admin/mcp/authorize',
+          component: McpAuthorizeDialog,
+          props: (route) => ({ show: true, requestId: route.query.request }),
+        },
+      ],
+    })
+    await router.push('/admin/mcp/authorize?request=request-two')
+    await router.push('/admin/mcp/authorize?request=request-one')
+    const wrapper = mount(RouterView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          BaseDialog: { template: '<section><slot/><slot name="footer"/></section>' },
+          TotpStepUpDialog: {
+            name: 'TotpStepUpDialog',
+            props: ['controller'],
+            template: '<div />',
+          },
+          Icon: true,
+          Select: true,
+        },
+      },
+    })
+    await flushPromises()
+    const controller = wrapper
+      .getComponent({ name: 'TotpStepUpDialog' })
+      .props('controller') as StepUpController
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'admin.mcp.oauth.authorize')!
+      .trigger('click')
+    router.back()
+    await flushPromises()
+    expect(wrapper.getComponent({ name: 'TotpStepUpDialog' }).props('controller')).toBe(controller)
+    expect(wrapper.getComponent(McpAuthorizeDialog).props('requestId')).toBe('request-two')
+    rejectDecision({ code: 'STEP_UP_REQUIRED' })
+    await flushPromises()
+    expect(controller.visible.value).toBe(false)
+    expect(api.decideOAuthRequest).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  // A current request still needs the controller's normal verification and retry.
+  // Cancelling settles its submission and leaves consent available for a later explicit decision.
+  it.each([false, true])('settles current verification with verified=%s', async (verified) => {
+    api.decideOAuthRequest
+      .mockRejectedValueOnce({ code: 'STEP_UP_REQUIRED' })
+      .mockRejectedValueOnce(new Error('Retry failed'))
+    const wrapper = page()
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'admin.mcp.oauth.authorize')!
+      .trigger('click')
+    await flushPromises()
+    const controller = wrapper
+      .getComponent({ name: 'TotpStepUpDialog' })
+      .props('controller') as StepUpController
+    expect(controller.visible.value).toBe(true)
+    if (verified) controller.onVerified()
+    else controller.onCancel()
+    await flushPromises()
+    expect(api.decideOAuthRequest).toHaveBeenCalledTimes(verified ? 2 : 1)
+    expect(controller.visible.value).toBe(false)
+    expect(wrapper.text()).not.toContain('step-up verification cancelled by user')
+    expect(
+      wrapper
+        .findAll('button')
+        .find((button) => button.text() === 'admin.mcp.oauth.authorize')!
+        .attributes('disabled'),
+    ).toBeUndefined()
+    wrapper.unmount()
   })
 
   // A first-time application receives safe reads as its initial draft. No

@@ -17,7 +17,8 @@ import (
 // raw credentials, PKCE verifiers, and confidential client secrets are excluded.
 // Loading reconstructs the concrete session before Fosite performs expiration,
 // signature, redirect, and PKCE validation. Current application permissions are
-// checked separately from the protocol's granted scopes and audience.
+// checked separately from the protocol's granted scopes and audience. Client revocation
+// reads ownership without requiring current grant or administrator admission.
 //
 // Replay errors must commit family revocation even though no token is issued.
 // The request-local outcome marks that exceptional transaction result. Other
@@ -31,6 +32,14 @@ type oauthExchangeKey struct{}
 type oauthExchange struct {
 	clientID string // authenticated request client identifier
 	replay   bool   // commit detected replay revocation
+}
+
+// oauthRevocationKey identifies ownership-only reads during a client revocation request.
+type oauthRevocationKey struct{}
+
+// oauthRevocation retains failures that Fosite can suppress during credential discovery.
+type oauthRevocation struct {
+	err error // first failed revocation storage operation
 }
 
 // oauthSession binds Fosite expiration data to one canonical application grant.
@@ -55,9 +64,14 @@ func (s *oauthSession) Clone() fosite.Session {
 }
 
 // GetClient resolves validated metadata and returns Fosite's client authentication representation.
+// During revocation, unavailable metadata is also recorded on the request so an
+// authentication failure cannot hide an unavailable client store from the response.
 func (s *oauthStore) GetClient(ctx context.Context, id string) (fosite.Client, error) {
 	client, err := s.server.client(ctx, id)
 	if err != nil {
+		if revocation, ok := ctx.Value(oauthRevocationKey{}).(*oauthRevocation); ok && !errors.Is(err, identity.ErrMCPTokenNotFound) {
+			revocation.err = err
+		}
 		return nil, fosite.ErrInvalidClient
 	}
 	return &fosite.DefaultOpenIDConnectClient{DefaultClient: &fosite.DefaultClient{
@@ -134,8 +148,18 @@ func (s *oauthStore) save(ctx context.Context, kind, signature string, request f
 // Inactive code and refresh records return the original requester with Fosite's
 // replay error so revocation can identify the complete family. Other inactive
 // records are unavailable. Active records require an unexpired deadline and a
-// currently authorized administrator, then resolve current client metadata.
-func (s *oauthStore) load(ctx context.Context, kind, signature string) (fosite.Requester, error) {
+// currently authorized administrator, then resolve current client metadata. Revocation
+// retains only the stored ownership checks so disabled grants and inactive owners
+// can still remove credentials, including expired or previously consumed tokens.
+func (s *oauthStore) load(ctx context.Context, kind, signature string) (_ fosite.Requester, loadErr error) {
+	revocation, _ := ctx.Value(oauthRevocationKey{}).(*oauthRevocation)
+	defer func() {
+		// Fosite may recover from one token-kind lookup by trying the other kind.
+		// A persistence failure must still abort the transaction even if that fallback succeeds.
+		if revocation != nil && loadErr != nil && !errors.Is(loadErr, fosite.ErrNotFound) && revocation.err == nil {
+			revocation.err = loadErr
+		}
+	}()
 	record, err := s.server.repo.GetSession(ctx, kind, signature)
 	if errors.Is(err, identity.ErrMCPTokenNotFound) {
 		return nil, fosite.ErrNotFound
@@ -154,6 +178,9 @@ func (s *oauthStore) load(ctx context.Context, kind, signature string) (fosite.R
 	exchange, _ := ctx.Value(oauthExchangeKey{}).(*oauthExchange)
 	if session.Issuer != s.server.issuer || session.Resource != s.server.Resource() || exchange != nil && exchange.clientID != request.Client.GetID() {
 		return nil, fosite.ErrNotFound
+	}
+	if revocation != nil {
+		return request, nil
 	}
 	if !record.Active {
 		if kind == "refresh" || kind == "code" {
@@ -201,7 +228,9 @@ func (s *oauthStore) CreateAccessTokenSession(ctx context.Context, signature str
 	return s.save(ctx, "access", signature, request)
 }
 
-// GetAccessTokenSession reconstructs the stored access request after current authorization checks.
+// GetAccessTokenSession reconstructs access ownership for revocation or validates current admission.
+// Only requests carrying the private revocation context bypass grant and account
+// admission; introspection retains the active credential and current administrator checks.
 func (s *oauthStore) GetAccessTokenSession(ctx context.Context, signature string, _ fosite.Session) (fosite.Requester, error) {
 	return s.load(ctx, "access", signature)
 }
@@ -216,7 +245,9 @@ func (s *oauthStore) CreateRefreshTokenSession(ctx context.Context, signature st
 	return s.save(ctx, "refresh", signature, request)
 }
 
-// GetRefreshTokenSession reconstructs the stored refresh request after current authorization checks.
+// GetRefreshTokenSession reconstructs refresh ownership for revocation or validates current admission.
+// Token exchanges retain active grant and administrator checks, plus consumed-token
+// replay detection; the private revocation context permits ownership-only credential reads.
 func (s *oauthStore) GetRefreshTokenSession(ctx context.Context, signature string, _ fosite.Session) (fosite.Requester, error) {
 	return s.load(ctx, "refresh", signature)
 }

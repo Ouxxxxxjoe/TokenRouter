@@ -162,7 +162,9 @@ func (s *MCPOAuthServer) Metadata() map[string]any {
 // The stored form retains the original PKCE challenge, resource, redirect, and
 // state across the administrator login. Only the fields needed to reconstruct
 // that validated request are persisted; unrelated query members cannot become
-// credentials or change the later browser decision.
+// credentials or change the later browser decision. The effective callback is
+// stored separately so an omitted redirect parameter keeps its token-exchange
+// meaning while the browser still sees the address selected during validation.
 func (s *MCPOAuthServer) Start(w http.ResponseWriter, r *http.Request) {
 	form, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil || !singleOAuthValues(form) {
@@ -202,7 +204,7 @@ func (s *MCPOAuthServer) Start(w http.ResponseWriter, r *http.Request) {
 			clean.Set(key, value)
 		}
 	}
-	pending := &identity.MCPOAuthPending{ID: id, Form: clean, Client: *client, ExpiresAt: time.Now().UTC().Add(10 * time.Minute)}
+	pending := &identity.MCPOAuthPending{ID: id, Form: clean, RedirectURI: request.GetRedirectURI().String(), Client: *client, ExpiresAt: time.Now().UTC().Add(10 * time.Minute)}
 	if err := s.repo.PutPending(r.Context(), pending); err != nil {
 		s.authorizeError(w, r, request, fosite.ErrServerError)
 		return
@@ -278,7 +280,9 @@ func (s *MCPOAuthServer) Review(ctx context.Context, id string, userID int64, se
 // revoking earlier families, and storing the new code succeed together. Callback
 // publication follows commit, so a persistence error cannot disclose a code for
 // an incomplete grant. Denial consumes the same ticket and returns access_denied
-// without creating an application authorization.
+// without creating an application authorization. Revalidation uses the callback
+// selected at request creation, while code storage retains whether the client
+// supplied redirect_uri so omission remains valid at the token endpoint.
 func (s *MCPOAuthServer) Decide(ctx context.Context, id string, userID int64, sessionID, nonce string, approve bool, permissions []string) (string, error) {
 	if err := s.administrator(ctx, userID); err != nil {
 		return "", err
@@ -295,13 +299,24 @@ func (s *MCPOAuthServer) Decide(ctx context.Context, id string, userID int64, se
 		if pending.Form.Get("resource") != s.Resource() {
 			return apperror.BadRequest("MCP_OAUTH_REQUEST_INVALID", "Site address changed; reconnect")
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.issuer+"/mcp/oauth/authorize?"+pending.Form.Encode(), nil)
+		// Pin the previously selected callback while checking current client metadata.
+		// A changed sole registered callback must not silently replace the consent destination.
+		form := maps.Clone(pending.Form)
+		form.Set("redirect_uri", pending.RedirectURI)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.issuer+"/mcp/oauth/authorize?"+form.Encode(), nil)
 		if err != nil {
 			return err
 		}
 		request, err := s.protocol.NewAuthorizeRequest(ctx, req)
 		if err != nil {
 			return apperror.BadRequest("MCP_OAUTH_REQUEST_INVALID", "Application configuration changed; reconnect")
+		}
+		// Fosite compares the stored form during code redemption. Restore parameter
+		// presence so clients that omitted redirect_uri can also omit it when exchanging.
+		if values, exists := pending.Form["redirect_uri"]; exists {
+			request.GetRequestForm()["redirect_uri"] = values
+		} else {
+			request.GetRequestForm().Del("redirect_uri")
 		}
 		target := *request.GetRedirectURI()
 		query := target.Query()
@@ -396,11 +411,36 @@ func (s *MCPOAuthServer) Token(w http.ResponseWriter, r *http.Request) {
 }
 
 // Revoke validates client ownership and atomically invalidates the submitted credential family.
-// Unknown credentials retain OAuth's successful revocation response. Persistence
-// failure prevents success from being reported to the requesting client.
+// Unknown credentials retain OAuth's successful revocation response. The request-local
+// outcome preserves storage errors even when Fosite's alternate token lookup succeeds.
+//
+// Client authentication still precedes credential discovery, but revocation does not
+// require current application or administrator admission. Callback failures roll back
+// mutations; storage failures receive OAuth 503, including failures before the callback
+// or during commit. Responses are published only after the transaction returns so
+// clients can retry revocation without assuming a credential was removed when the
+// database did not confirm the final outcome.
 func (s *MCPOAuthServer) Revoke(w http.ResponseWriter, r *http.Request) {
-	err := s.repo.Transaction(r.Context(), func(ctx context.Context) error { return s.protocol.NewRevocationRequest(ctx, r.WithContext(ctx)) })
-	s.protocol.WriteRevocationResponse(r.Context(), w, err)
+	revocation := &oauthRevocation{}
+	ctx := context.WithValue(r.Context(), oauthRevocationKey{}, revocation)
+	var protocolErr error
+	err := s.repo.Transaction(ctx, func(ctx context.Context) error {
+		protocolErr = s.protocol.NewRevocationRequest(ctx, r.WithContext(ctx))
+		if revocation.err != nil {
+			return revocation.err
+		}
+		return protocolErr
+	})
+	if err != nil {
+		// Fosite's revocation writer treats most errors as successful revocations.
+		// Preserve its client errors, but report persistence failures through its OAuth JSON writer.
+		clientError := errors.Is(protocolErr, fosite.ErrInvalidRequest) || errors.Is(protocolErr, fosite.ErrInvalidClient) || errors.Is(protocolErr, fosite.ErrUnauthorizedClient)
+		if revocation.err != nil || !clientError || !errors.Is(err, protocolErr) {
+			s.protocol.WriteAccessError(ctx, w, nil, fosite.ErrTemporarilyUnavailable)
+			return
+		}
+	}
+	s.protocol.WriteRevocationResponse(ctx, w, protocolErr)
 }
 
 // Authenticate verifies an access credential and resolves its current application permissions.
@@ -438,6 +478,8 @@ func (s *MCPOAuthServer) Authenticate(ctx context.Context, credential string) (*
 // AuthorizeGrant reloads application permissions and the current administrator account.
 // Disabled, expired, revoked, or demoted owners cannot authorize later requests.
 // Reading a stable grant does not require a particular rotating access credential.
+// The account eligibility read uses the repository transaction context, allowing
+// credential exchanges to complete using their already-held database connection.
 func (s *MCPOAuthServer) AuthorizeGrant(ctx context.Context, id int64) (*identity.MCPToken, error) {
 	current, err := s.Current(ctx)
 	if err != nil {
@@ -448,8 +490,9 @@ func (s *MCPOAuthServer) AuthorizeGrant(ctx context.Context, id int64) (*identit
 	if err != nil || grant.Resource != s.Resource() || !grant.Enabled || grant.RevokedAt != nil || grant.ExpiresAt != nil && !time.Now().Before(*grant.ExpiresAt) {
 		return nil, identity.ErrMCPTokenInvalid
 	}
-	if err := s.administrator(ctx, grant.UserID); err != nil {
-		return nil, err
+	allowed, err := s.repo.IsAdministrator(ctx, grant.UserID)
+	if err != nil || !allowed {
+		return nil, identity.ErrMCPTokenInvalid
 	}
 	return &grant.MCPToken, nil
 }

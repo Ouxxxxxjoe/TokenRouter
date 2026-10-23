@@ -51,13 +51,16 @@ type MCPOAuthGrant struct {
 
 // MCPOAuthPending retains a validated authorization request until one browser decides it.
 type MCPOAuthPending struct {
-	ID        string         `json:"id"`         // opaque browser request identifier
-	Form      url.Values     `json:"-"`          // validated noncredential authorization parameters
-	Client    MCPOAuthClient `json:"client"`     // validated public client metadata
-	UserID    int64          `json:"-"`          // bound approving administrator identifier
-	SessionID string         `json:"-"`          // bound authenticated browser session
-	ExpiresAt time.Time      `json:"expires_at"` // absolute authorization request deadline
-	Consumed  bool           `json:"-"`          // permanently completed decision marker
+	ID   string     `json:"id"` // opaque browser request identifier
+	Form url.Values `json:"-"`  // original validated authorization parameters
+	// RedirectURI retains the callback selected during validation, including when
+	// Form omits redirect_uri; consent revalidates this address against current metadata.
+	RedirectURI string         `json:"-"`          // validated effective callback address
+	Client      MCPOAuthClient `json:"client"`     // validated public client metadata
+	UserID      int64          `json:"-"`          // bound approving administrator identifier
+	SessionID   string         `json:"-"`          // bound authenticated browser session
+	ExpiresAt   time.Time      `json:"expires_at"` // absolute authorization request deadline
+	Consumed    bool           `json:"-"`          // permanently completed decision marker
 }
 
 // MCPOAuthSession stores a protocol request under an irreversible credential signature.
@@ -75,7 +78,7 @@ type MCPOAuthSession struct {
 type MCPOAuthRepository interface {
 	// Transaction commits the callback on success and rolls back every returned error.
 	// Implementations propagate the transaction through context; callbacks must keep
-	// all exchange mutations on that context and publish credentials after commit.
+	// all exchange reads and mutations on that context and publish credentials after commit.
 	Transaction(context.Context, func(context.Context) error) error
 	// PutClient persists verified metadata, preserving an existing client's immutable registration.
 	PutClient(context.Context, *MCPOAuthClient) error
@@ -86,9 +89,17 @@ type MCPOAuthRepository interface {
 	// BindPending binds and reads an unconsumed request for this browser session.
 	BindPending(context.Context, string, int64, string) (*MCPOAuthPending, error)
 	// ConsumePending locks and consumes a request belonging to the supplied browser session.
+	// Call within Transaction and retain its context so failed consent rolls back
+	// consumption together with grant changes and authorization-code creation.
 	ConsumePending(context.Context, string, int64, string) (*MCPOAuthPending, error)
 	// SaveGrant creates or updates this client's live grant and invalidates previous credentials.
+	// Call within Transaction using its context to hold grant locks through code
+	// creation and commit the complete browser decision as one persistent change.
 	SaveGrant(context.Context, int64, *MCPOAuthClient, string, []string) (*MCPOAuthGrant, error)
+	// IsAdministrator reports whether an account is active, undeleted, and an administrator.
+	// Reads use the transaction carried in context when present, keeping credential
+	// admission on the exchange connection instead of borrowing another pooled connection.
+	IsAdministrator(context.Context, int64) (bool, error)
 	// GetGrant reads current grant metadata including its latest active connection expiry.
 	GetGrant(context.Context, int64) (*MCPOAuthGrant, error)
 	// ListGrants reads application authorizations owned by one authenticated administrator.
@@ -100,6 +111,8 @@ type MCPOAuthRepository interface {
 	// PutSession persists one sanitized request under its protocol credential signature.
 	PutSession(context.Context, *MCPOAuthSession) error
 	// GetSession reads credential state and serializes its family inside exchange transactions.
+	// Exchanges must use the context supplied by Transaction and retain it through
+	// credential mutation; outside a transaction the result is an unlocked observation.
 	GetSession(context.Context, string, string) (*MCPOAuthSession, error)
 	// InvalidateSession marks a credential consumed while retaining its replay detection record.
 	InvalidateSession(context.Context, string, string) error

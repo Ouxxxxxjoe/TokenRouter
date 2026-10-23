@@ -109,9 +109,9 @@ import (
 	routeusageadmin "github.com/TokenFlux/TokenRouter/internal/usage/httpapi/admin"
 )
 
-// HTTP assembly tests need production selection and forwarding rules while
-// controlling repository results, credentials, and upstream responses. The
-// fixtures bind those components through application providers, then expose
+// helpers_test.go supplies HTTP assembly fixtures using production selection and
+// forwarding rules while controlling repository results, credentials, and upstream
+// responses. The fixtures bind those components through application providers, then expose
 // narrowly implemented stores whose observations let tests distinguish provider
 // selection, credential mutation, forwarding, and completion recording.
 //
@@ -152,6 +152,13 @@ var (
 	// later lookups cannot retain that router.
 	handlerRefresherStarted sync.Map
 )
+
+// mcpSettingsFixture implements the setting operations used by OAuth configuration.
+type mcpSettingsFixture struct {
+	settingscore.Repository                   // Unused storage methods reject accidental calls.
+	values                  map[string]string // Current persisted setting values.
+	err                     error             // Injected storage read or write failure.
+}
 
 // messageExecutionFixture holds routing, session, cooldown, and completion
 // inputs for message-compatible handlers.
@@ -836,6 +843,19 @@ type settingHandlerRepoStub struct {
 	// call, including an empty map for empty updates, so assertions observe
 	// that call alone.
 	lastUpdates map[string]string
+}
+
+// GetValue reads one fixture setting and distinguishes absence from storage failure.
+// Missing keys return the production absence sentinel, allowing the assembled
+// browser-origin reader to skip unconfigured URLs while keeping saved addresses.
+func (s *mcpSettingsFixture) GetValue(_ context.Context, key string) (string, error) {
+	if s.err != nil {
+		return "", s.err
+	}
+	if value, ok := s.values[key]; ok {
+		return value, nil
+	}
+	return "", settingscore.ErrSettingNotFound
 }
 
 // newGenericExecutionAndSelectionFixture binds generic selection and Messages

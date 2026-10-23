@@ -2,8 +2,6 @@ package app
 
 import (
 	"bytes"
-	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,17 +16,10 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/settings"
 )
 
-// mcp_test.go verifies site configuration and durable MCP artifact encryption.
-// The tests distinguish missing settings from failed storage, retain deployment
-// frontend defaults, and check that backend restarts can decrypt surviving files
-// while configured TOTP encryption keeps its existing key.
-
-// mcpSettingsFixture implements the setting operations used by OAuth configuration.
-type mcpSettingsFixture struct {
-	settings.Repository                   // Unused storage methods reject accidental calls.
-	values              map[string]string // Current persisted setting values.
-	err                 error             // Injected storage read or write failure.
-}
+// mcp_test.go verifies browser-origin admission and durable MCP artifact encryption.
+// The tests check that backend restarts can decrypt surviving files and configured
+// TOTP encryption keeps its existing key. Browser admission and OAuth discovery
+// use the same configured frontend origin.
 
 // TestMCPArtifactCipherUsesDurableOAuthKey recreates encryption after a backend restart.
 // A different temporary TOTP key must not prevent reading files encrypted with
@@ -58,37 +49,6 @@ func TestMCPArtifactCipherUsesDurableOAuthKey(t *testing.T) {
 	cfg.MCPOAuthSigningSecret = ""
 	_, err = mcpArtifactCipher(first, cfg)
 	require.Error(t, err)
-}
-
-// GetValue reads one fixture setting and distinguishes absence from storage failure.
-// Missing keys return the production absence sentinel, allowing the assembled
-// browser-origin reader to skip unconfigured URLs while keeping saved addresses.
-func (s *mcpSettingsFixture) GetValue(_ context.Context, key string) (string, error) {
-	if s.err != nil {
-		return "", s.err
-	}
-	if value, ok := s.values[key]; ok {
-		return value, nil
-	}
-	return "", settings.ErrSettingNotFound
-}
-
-// TestMCPOAuthUsesFrontendSettings verifies the upgrade path with existing site configuration.
-// Database frontend values override deployment defaults, API display URLs are
-// ignored, and storage failure cannot activate a different fallback origin.
-func TestMCPOAuthUsesFrontendSettings(t *testing.T) {
-	repo := &mcpSettingsFixture{values: map[string]string{"api_base_url": "https://api.example"}}
-	adapter := &mcpOAuthFrontend{store: settings.New(repo), frontendURL: "https://deployment.example"}
-	frontend, err := adapter.FrontendURL(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "https://deployment.example", frontend)
-	repo.values["frontend_url"] = " https://site.example "
-	frontend, err = adapter.FrontendURL(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "https://site.example", frontend)
-	repo.err = errors.New("database unavailable")
-	_, err = adapter.FrontendURL(t.Context())
-	require.ErrorIs(t, err, repo.err)
 }
 
 // TestMCPBrowserOriginUsesFrontendURL assembles the transport with a deployment site address.

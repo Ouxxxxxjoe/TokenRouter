@@ -242,6 +242,8 @@ func (h *Handler) oauthStatus(c *gin.Context) {
 }
 
 // oauthReview returns a validated request, existing grants, and available operation choices.
+// The displayed callback is the effective address selected at authorization start,
+// including when the client omitted redirect_uri and registered exactly one address.
 func (h *Handler) oauthReview(c *gin.Context) {
 	if !h.oauthBrowser(c) {
 		return
@@ -262,7 +264,7 @@ func (h *Handler) oauthReview(c *gin.Context) {
 		"nonce":        review.Nonce,
 		"grant":        review.Grant,
 		"operations":   h.catalog.Operations(),
-		"redirect_uri": review.Request.Form.Get("redirect_uri"),
+		"redirect_uri": review.Request.RedirectURI,
 	})
 }
 

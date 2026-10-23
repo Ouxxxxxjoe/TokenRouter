@@ -42,7 +42,7 @@ github.com/stretchr/testify/assert github.com/stripe/stripe-go/v85`},
 		"http": {Production: `github.com/modelcontextprotocol/go-sdk/mcp github.com/google/jsonschema-go/jsonschema github.com/coder/websocket github.com/gin-gonic/gin github.com/gin-gonic/gin/binding
 github.com/google/uuid github.com/google/wire github.com/gorilla/websocket
 github.com/klauspost/compress/zstd github.com/tidwall/gjson github.com/tidwall/sjson go.uber.org/zap
-golang.org/x/net/http/httpguts golang.org/x/net/http2 golang.org/x/sync/singleflight`, Tests: `github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex golang.org/x/oauth2 github.com/alicebob/miniredis/v2 github.com/redis/go-redis/v9 github.com/cespare/xxhash/v2 github.com/imroc/req/v3 github.com/stretchr/testify/assert
+golang.org/x/net/http/httpguts golang.org/x/net/http2 golang.org/x/sync/singleflight`, Tests: `entgo.io/ent/dialect entgo.io/ent/dialect/sql github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex golang.org/x/oauth2 github.com/alicebob/miniredis/v2 github.com/redis/go-redis/v9 github.com/cespare/xxhash/v2 github.com/imroc/req/v3 github.com/stretchr/testify/assert
 github.com/stretchr/testify/require go.uber.org/zap/zaptest/observer`},
 		"infra": {Production: `github.com/tidwall/gjson github.com/andybalholm/brotli github.com/imroc/req/v3 github.com/klauspost/compress/zstd
 github.com/lib/pq github.com/redis/go-redis/v9 github.com/refraction-networking/utls
@@ -105,7 +105,7 @@ github.com/stretchr/testify/suite`},
 
 	moduleDependencies = map[string]dependencySet{
 		"internal/mcp": {Production: `internal/mcp/... internal/identity internal/identity/provider internal/identity/httpapi internal/identity/httpapi/authctx
-internal/audit internal/server/adminapi internal/server/httpx`, Tests: `internal/identity/postgres internal/infra/crypto internal/testutil/postgrescontainer migrations`},
+internal/audit internal/server/adminapi internal/server/httpx`, Tests: `ent ent/runtime internal/identity/postgres internal/infra/crypto internal/testutil/postgrescontainer migrations`},
 		"internal/requestlog": {Production: `internal/requestlog/... internal/infra/telemetry/... internal/identity/httpapi/authctx internal/server/httpx`, Tests: `internal/testutil/postgrescontainer migrations`},
 		"internal/modelcatalog": {Production: `internal/pkg/locale internal/modelcatalog internal/modelcatalog/provider internal/billing/pricing
 internal/egress internal/infra/httpclient/... internal/infra/telemetry/...`, Tests: `internal/billing internal/billing/provider
@@ -407,10 +407,10 @@ internal/upstream/zhipu/...`, Tests: ""},
 
 	// 窄权限属于指定文件，不能由相邻文件或目标子包继承。
 	filePermissions = []filePermission{
-		// OAuth registration hashes confidential-client secrets in its protocol adapter.
-		{Scope: "internal/identity/provider", Imports: "golang.org/x/crypto/bcrypt", Files: "mcp_oauth_clients.go"},
-		// Protocol acceptance uses the official OAuth client against migrated PostgreSQL.
-		{Scope: "internal/mcp/httpapi", Imports: "database/sql github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex internal/identity/postgres golang.org/x/oauth2", Files: "oauth_integration_test.go"},
+		// OAuth registration hashes confidential-client secrets; revocation tests verify their authentication behavior.
+		{Scope: "internal/identity/provider", Imports: "golang.org/x/crypto/bcrypt", Files: "mcp_oauth_clients.go mcp_oauth_test.go"},
+		// Protocol acceptance uses migrated PostgreSQL and the production account reader on one connection pool.
+		{Scope: "internal/mcp/httpapi", Imports: "database/sql ent ent/runtime entgo.io/ent/dialect entgo.io/ent/dialect/sql github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex internal/identity/postgres golang.org/x/oauth2", Files: "oauth_integration_test.go"},
 		// Creative's OpenAI adapter uses the shared native Images reader for mode
 		// conversion; adjacent creative files retain their existing dependency limits.
 		{Scope: "internal/creative", Imports: "internal/upstream/openai", Files: "provider/openai.go"},
@@ -504,6 +504,7 @@ internal/routing/testkit`,
 	}
 
 	permissionChildImports = map[string]string{
+		"internal/mcp/httpapi":             "ent/runtime entgo.io/ent/dialect/sql",
 		"internal/gateway/provider":        "internal/modelcatalog/provider internal/modelcatalog/testkit",
 		"internal/testutil/rediscontainer": "github.com/testcontainers/testcontainers-go/modules/redis github.com/testcontainers/testcontainers-go/wait",
 		"internal/gateway/clientmeta":      "net/http/httptest",

@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/gin-gonic/gin"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,6 +28,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 
+	"github.com/TokenFlux/TokenRouter/ent"
+	_ "github.com/TokenFlux/TokenRouter/ent/runtime"
 	"github.com/TokenFlux/TokenRouter/internal/identity"
 	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
 	"github.com/TokenFlux/TokenRouter/internal/identity/postgres"
@@ -57,6 +61,27 @@ type oauthFrontendFixture struct {
 	mu  sync.RWMutex // Protects HTTP and test configuration access.
 	url string       // Current public frontend address.
 	err error        // Injected configuration read failure.
+}
+
+// pausedOAuthRepository holds an exchange immediately before its replacement access row.
+// The transaction has already consumed the old refresh row, allowing the test to
+// observe cleanup waiting on the family locks while the credential deadline passes.
+type pausedOAuthRepository struct {
+	identity.MCPOAuthRepository               // production OAuth persistence implementation
+	entered                     chan struct{} // replacement insertion reached signal
+	resume                      chan struct{} // permission to finish insertion
+}
+
+// oauthRefreshResult carries an HTTP refresh response between the test goroutines.
+type oauthRefreshResult struct {
+	status int            // HTTP token response status
+	pair   map[string]any // decoded OAuth response fields
+}
+
+// failingRevocationRepository injects failures around production PostgreSQL revocation writes.
+type failingRevocationRepository struct {
+	identity.MCPOAuthRepository        // production OAuth persistence implementation
+	stage                       string // selected failing transaction stage
 }
 
 // newOAuthFixture mounts OAuth beside the existing production MCP handler.
@@ -359,6 +384,123 @@ func TestOAuthClientResourceBindingAndRevocation(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestOAuthRevocationFailureRollsBack uses real credentials and PostgreSQL transactions
+// with injected revocation failures. HTTP 503 must leave the family usable until
+// a later successful retry commits revocation of both access and refresh credentials.
+func TestOAuthRevocationFailureRollsBack(t *testing.T) {
+	f := newOAuthFixture(t)
+	for _, stage := range []string{"begin", "read", "write", "commit"} {
+		t.Run(stage, func(t *testing.T) {
+			clientID := f.register(t)
+			code, verifier := f.code(t, clientID)
+			status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+			require.Equal(t, http.StatusOK, status, pair)
+			access := oauthString(t, pair, "access_token")
+			refresh := oauthString(t, pair, "refresh_token")
+			grant, err := f.oauth.Authenticate(t.Context(), access)
+			require.NoError(t, err)
+			failing := &failingRevocationRepository{MCPOAuthRepository: f.repo, stage: stage}
+			root := f.handler.options.OAuth
+			f.handler.options.OAuth = provider.NewMCPOAuthServer(failing, f.accounts, f.config, bytes.Repeat([]byte{7}, 32))
+			t.Cleanup(func() { f.handler.options.OAuth = root })
+			response, err := http.PostForm(f.http.URL+"/mcp/oauth/revoke", url.Values{"client_id": {clientID}, "token": {refresh}})
+			require.NoError(t, err)
+			var body map[string]any
+			require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
+			require.NoError(t, response.Body.Close())
+			require.Equal(t, http.StatusServiceUnavailable, response.StatusCode, body)
+			require.Equal(t, "temporarily_unavailable", body["error"])
+			_, err = f.oauth.Authenticate(t.Context(), access)
+			require.NoError(t, err)
+			var activeRefresh int
+			require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM mcp_oauth_sessions WHERE grant_id=$1 AND kind='refresh' AND active`, grant.ID).Scan(&activeRefresh))
+			require.Equal(t, 1, activeRefresh)
+			// The failed HTTP request has completed before restoring the unwrapped repository.
+			// A retry must commit revocation rather than inheriting request-local failure state.
+			f.handler.options.OAuth = root
+			response, err = http.PostForm(f.http.URL+"/mcp/oauth/revoke", url.Values{"client_id": {clientID}, "token": {refresh}})
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			_, err = f.oauth.Authenticate(t.Context(), access)
+			require.Error(t, err)
+			status, _ = f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refresh}})
+			require.Equal(t, http.StatusBadRequest, status)
+		})
+	}
+}
+
+// TestOAuthRevocationDuringAdmissionDenial revokes credentials while application or
+// account admission is unavailable. Restoring the grant or administrator role must
+// never restore the revoked access and refresh credentials for either token hint.
+func TestOAuthRevocationDuringAdmissionDenial(t *testing.T) {
+	f := newOAuthFixture(t)
+	for _, denial := range []string{"disabled", "expired", "demoted"} {
+		for _, kind := range []string{"access_token", "refresh_token"} {
+			t.Run(denial+"/"+kind, func(t *testing.T) {
+				clientID := f.register(t)
+				code, verifier := f.code(t, clientID)
+				status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+				require.Equal(t, http.StatusOK, status, pair)
+				access := oauthString(t, pair, "access_token")
+				refresh := oauthString(t, pair, "refresh_token")
+				grant, err := f.oauth.Authenticate(t.Context(), access)
+				require.NoError(t, err)
+				input := identity.MCPTokenInput{Name: grant.Name, Enabled: denial != "disabled", Permissions: grant.Permissions, ExpectedUpdatedAt: &grant.UpdatedAt}
+				if denial == "expired" {
+					expired := time.Now().Add(-time.Hour)
+					input.ExpiresAt = &expired
+				}
+				var updated *identity.MCPOAuthGrant
+				if denial == "demoted" {
+					f.accounts.role.Store(identity.RoleUser)
+					_, err = f.db.ExecContext(t.Context(), `UPDATE users SET role='user' WHERE id=$1`, f.userID)
+					require.NoError(t, err)
+					t.Cleanup(func() {
+						f.accounts.role.Store(identity.RoleAdmin)
+						_, restoreErr := f.db.Exec(`UPDATE users SET role='admin' WHERE id=$1`, f.userID)
+						require.NoError(t, restoreErr)
+					})
+				} else {
+					if denial == "expired" {
+						// Backdate persisted expiry to exercise elapsed authorization without a timed wait.
+						// The public update API correctly rejects dates that have already passed.
+						updated, err = f.repo.UpdateGrant(t.Context(), f.userID, grant.ID, input)
+					} else {
+						updated, err = f.oauth.UpdateGrant(t.Context(), f.userID, grant.ID, input)
+					}
+					require.NoError(t, err)
+				}
+				_, err = f.oauth.Authenticate(t.Context(), access)
+				require.Error(t, err)
+				status, _ = f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refresh}})
+				require.Equal(t, http.StatusBadRequest, status)
+				// Denied admission must still permit client-owned removal before the administrator
+				// restores the application, otherwise both credential types become usable again.
+				response, err := http.PostForm(f.http.URL+"/mcp/oauth/revoke", url.Values{"client_id": {clientID}, "token": {oauthString(t, pair, kind)}, "token_type_hint": {kind}})
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+				require.Equal(t, http.StatusOK, response.StatusCode)
+				if denial == "demoted" {
+					f.accounts.role.Store(identity.RoleAdmin)
+					_, err = f.db.ExecContext(t.Context(), `UPDATE users SET role='admin' WHERE id=$1`, f.userID)
+					require.NoError(t, err)
+				} else {
+					input.Enabled = true
+					input.ExpiresAt = nil
+					input.ExpectedUpdatedAt = &updated.UpdatedAt
+					_, err = f.oauth.UpdateGrant(t.Context(), f.userID, grant.ID, input)
+					require.NoError(t, err)
+				}
+				_, err = f.oauth.Authenticate(t.Context(), access)
+				require.Error(t, err)
+				status, _ = f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refresh}})
+				require.Equal(t, http.StatusBadRequest, status)
+			})
+		}
+	}
+}
+
 // TestOAuthConsentSessionIsolationAndExpiry binds a ticket to one browser session.
 // A different session, wrong nonce, repeat decision, or expired request cannot
 // create credentials; denial consumes the request without creating an application grant.
@@ -369,7 +511,7 @@ func TestOAuthConsentSessionIsolationAndExpiry(t *testing.T) {
 	require.NoError(t, err)
 	verifier := strings.Repeat("z", 64)
 	sum := sha256.Sum256([]byte(verifier))
-	pending := &identity.MCPOAuthPending{ID: "consent-ticket", Client: *client, ExpiresAt: time.Now().Add(time.Minute), Form: url.Values{"client_id": {clientID}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "response_type": {"code"}, "scope": {"mcp"}, "state": {"state-with-enough-entropy"}, "resource": {f.oauth.Resource()}, "code_challenge_method": {"S256"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}}}
+	pending := &identity.MCPOAuthPending{ID: "consent-ticket", RedirectURI: "http://127.0.0.1:43111/callback", Client: *client, ExpiresAt: time.Now().Add(time.Minute), Form: url.Values{"client_id": {clientID}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "response_type": {"code"}, "scope": {"mcp"}, "state": {"state-with-enough-entropy"}, "resource": {f.oauth.Resource()}, "code_challenge_method": {"S256"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}}}
 	require.NoError(t, f.repo.PutPending(t.Context(), pending))
 	review, err := f.oauth.Review(t.Context(), pending.ID, f.userID, "browser-a")
 	require.NoError(t, err)
@@ -641,4 +783,256 @@ func TestOAuthAvailabilityChangesWithoutRestart(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
 	_, err = root.Authenticate(t.Context(), access)
 	require.Error(t, err)
+}
+
+// TestOAuthCleanupPreservesConcurrentRefreshReplay overlaps expiration cleanup with an admitted refresh.
+// Cleanup must retain replay history so resubmitting the consumed refresh token
+// invalidates both newly issued credentials after the waiting cleanup finishes.
+func TestOAuthCleanupPreservesConcurrentRefreshReplay(t *testing.T) {
+	f := newOAuthFixture(t)
+	client := f.register(t)
+	code, verifier := f.code(t, client)
+	status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {client}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+	require.Equal(t, 200, status, pair)
+	oldRefresh := oauthString(t, pair, "refresh_token")
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	// Shorten SQL and Fosite deadlines together so an admitted refresh crosses expiration
+	// while the production transaction still holds its grant and family locks.
+	deadline := time.Now().Add(2 * time.Second)
+	_, err := f.db.Exec(`UPDATE mcp_oauth_sessions SET expires_at=$1, payload=jsonb_set(payload,'{session,expires_at,refresh_token}',to_jsonb($1::timestamptz))`, deadline)
+	require.NoError(t, err)
+	paused := &pausedOAuthRepository{MCPOAuthRepository: f.repo, entered: make(chan struct{}), resume: make(chan struct{})}
+	f.handler.options.OAuth = provider.NewMCPOAuthServer(paused, f.accounts, f.config, bytes.Repeat([]byte{7}, 32))
+
+	var release sync.Once
+	defer release.Do(func() { close(paused.resume) })
+	done := make(chan oauthRefreshResult, 1)
+	go func() {
+		status, pair := f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {client}, "refresh_token": {oldRefresh}})
+		done <- oauthRefreshResult{status: status, pair: pair}
+	}()
+	select {
+	case <-paused.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh did not reach insertion")
+	}
+	// Time advances expiration only; channels and PostgreSQL wait state establish the
+	// refresh and cleanup ordering before either transaction is permitted to finish.
+	<-time.After(time.Until(deadline) + 20*time.Millisecond)
+	cleaned := make(chan error, 1)
+	go func() { cleaned <- f.repo.Cleanup(ctx) }()
+	require.Eventually(t, func() bool {
+		var n int
+		err := f.db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND wait_event='advisory'`).Scan(&n)
+		return err == nil && n > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	release.Do(func() { close(paused.resume) })
+	var next oauthRefreshResult
+	select {
+	case next = <-done:
+	case <-ctx.Done():
+		t.Fatal("refresh did not complete: ", ctx.Err())
+	}
+	require.Equal(t, 200, next.status, next.pair)
+	select {
+	case err := <-cleaned:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("cleanup did not complete: ", ctx.Err())
+	}
+	var oldRows int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM mcp_oauth_sessions WHERE kind='refresh' AND NOT active`).Scan(&oldRows))
+	t.Logf("consumed refresh replay records after concurrent cleanup: %d", oldRows)
+	require.Equal(t, 1, oldRows)
+	access := oauthString(t, next.pair, "access_token")
+	_, err = f.oauth.Authenticate(t.Context(), access)
+	require.NoError(t, err)
+	status, _ = f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {client}, "refresh_token": {oldRefresh}})
+	require.Equal(t, 400, status)
+	_, err = f.oauth.Authenticate(t.Context(), access)
+	require.Error(t, err)
+	status, _ = f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {client}, "refresh_token": {oauthString(t, next.pair, "refresh_token")}})
+	require.Equal(t, 400, status)
+}
+
+// PutSession pauses replacement access insertion until the test releases the exchange.
+// The old refresh token is already consumed inside the transaction, while neither
+// replacement credential is published and the production family locks remain held.
+func (r *pausedOAuthRepository) PutSession(ctx context.Context, s *identity.MCPOAuthSession) error {
+	if s.Kind == "access" {
+		close(r.entered)
+		select {
+		case <-r.resume:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return r.MCPOAuthRepository.PutSession(ctx, s)
+}
+
+// Transaction injects begin failures or rolls back successful callbacks before commit.
+// The commit-stage injection runs inside the production transaction callback so
+// real writes are rolled back while the caller receives a persistence failure.
+func (r *failingRevocationRepository) Transaction(ctx context.Context, fn func(context.Context) error) error {
+	if r.stage == "begin" {
+		return errors.New("revocation begin unavailable")
+	}
+	return r.MCPOAuthRepository.Transaction(ctx, func(ctx context.Context) error {
+		if err := fn(ctx); err != nil {
+			return err
+		}
+		if r.stage == "commit" {
+			return errors.New("revocation commit unavailable")
+		}
+		return nil
+	})
+}
+
+// GetSession injects discovery failures before returning the persisted credential ownership.
+func (r *failingRevocationRepository) GetSession(ctx context.Context, kind, signature string) (*identity.MCPOAuthSession, error) {
+	if r.stage == "read" {
+		return nil, errors.New("revocation read unavailable")
+	}
+	return r.MCPOAuthRepository.GetSession(ctx, kind, signature)
+}
+
+// RevokeFamily fails after real invalidation to exercise the production rollback path.
+// Returning the injected error after the write proves the HTTP error response
+// preserves credentials through transaction rollback rather than merely skipping mutation.
+func (r *failingRevocationRepository) RevokeFamily(ctx context.Context, id string) error {
+	if err := r.MCPOAuthRepository.RevokeFamily(ctx, id); err != nil {
+		return err
+	}
+	if r.stage == "write" {
+		return errors.New("revocation write unavailable")
+	}
+	return nil
+}
+
+// TestOAuthOmittedRedirectURI retains the selected sole callback through browser
+// review, approval, denial, and code redemption. Replacing CIMD metadata after
+// review must reject both decisions locally instead of selecting the new callback.
+func TestOAuthOmittedRedirectURI(t *testing.T) {
+	f := newOAuthFixture(t)
+	const callbackURI = "https://client.example/callback?existing=value"
+	verifier := strings.Repeat("v", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	for _, scenario := range []struct {
+		name    string // distinct metadata document path
+		approve bool   // requested browser consent decision
+		replace bool   // remove the initially selected callback
+	}{
+		{name: "approve", approve: true},
+		{name: "deny"},
+		{name: "changed_approve", approve: true, replace: true},
+		{name: "changed_deny", replace: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			expires := time.Now().Add(5 * time.Minute)
+			clientID := "https://client.example/" + scenario.name + ".json"
+			client := &identity.MCPOAuthClient{ID: clientID, Name: "Default callback", RedirectURIs: []string{callbackURI}, GrantTypes: []string{"authorization_code", "refresh_token"}, AuthMethod: "none", ExpiresAt: &expires}
+			require.NoError(t, f.repo.PutClient(t.Context(), client))
+			form := url.Values{"client_id": {clientID}, "response_type": {"code"}, "scope": {"mcp offline_access"}, "state": {"default-callback-state"}, "resource": {f.oauth.Resource()}, "code_challenge_method": {"S256"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}}
+			response := httptest.NewRecorder()
+			f.oauth.Start(response, httptest.NewRequest(http.MethodGet, f.http.URL+"/mcp/oauth/authorize?"+form.Encode(), nil))
+			require.Equal(t, http.StatusFound, response.Code, response.Body.String())
+			redirect, err := url.Parse(response.Header().Get("Location"))
+			require.NoError(t, err)
+			requestID := redirect.Query().Get("request")
+			reviewResponse := f.browser(t, http.MethodGet, "/api/v1/admin/mcp/oauth/requests/"+requestID, "browser")
+			var review struct {
+				Data struct {
+					Nonce       string `json:"nonce"`        // browser-bound decision proof
+					RedirectURI string `json:"redirect_uri"` // displayed effective callback address
+				} `json:"data"` // authenticated review response fields
+			}
+			require.NoError(t, json.NewDecoder(reviewResponse.Body).Decode(&review))
+			require.NoError(t, reviewResponse.Body.Close())
+			require.Equal(t, http.StatusOK, reviewResponse.StatusCode)
+			require.Equal(t, callbackURI, review.Data.RedirectURI)
+			pending, err := f.repo.BindPending(t.Context(), requestID, f.userID, "fixture-session")
+			require.NoError(t, err)
+			require.Equal(t, callbackURI, pending.RedirectURI)
+			require.NotContains(t, pending.Form, "redirect_uri")
+			if scenario.replace {
+				client.RedirectURIs = []string{"https://replacement.example/callback"}
+				require.NoError(t, f.repo.PutClient(t.Context(), client))
+			}
+			body, err := json.Marshal(map[string]any{"nonce": review.Data.Nonce, "approve": scenario.approve, "permissions": []string{"fixture.get"}})
+			require.NoError(t, err)
+			decision, err := http.NewRequestWithContext(t.Context(), http.MethodPost, f.http.URL+"/api/v1/admin/mcp/oauth/requests/"+requestID+"/decision", bytes.NewReader(body))
+			require.NoError(t, err)
+			decision.Header.Set("Authorization", "Bearer browser")
+			decision.Header.Set("Content-Type", "application/json")
+			result, err := http.DefaultClient.Do(decision)
+			require.NoError(t, err)
+			var outcome struct {
+				Data struct {
+					RedirectURI string `json:"redirect_uri"` // committed client callback address
+				} `json:"data"` // browser decision response fields
+			}
+			require.NoError(t, json.NewDecoder(result.Body).Decode(&outcome))
+			require.NoError(t, result.Body.Close())
+			if scenario.replace {
+				require.Equal(t, http.StatusBadRequest, result.StatusCode)
+				require.Empty(t, outcome.Data.RedirectURI)
+				_, err = f.repo.BindPending(t.Context(), requestID, f.userID, "fixture-session")
+				require.NoError(t, err)
+				return
+			}
+			require.Equal(t, http.StatusOK, result.StatusCode)
+			callback, err := url.Parse(outcome.Data.RedirectURI)
+			require.NoError(t, err)
+			require.Equal(t, "client.example", callback.Host)
+			require.Equal(t, "value", callback.Query().Get("existing"))
+			require.Equal(t, "default-callback-state", callback.Query().Get("state"))
+			require.Equal(t, f.http.URL, callback.Query().Get("iss"))
+			if !scenario.approve {
+				require.Equal(t, "access_denied", callback.Query().Get("error"))
+				require.Empty(t, callback.Query().Get("code"))
+				return
+			}
+			status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {callback.Query().Get("code")}, "code_verifier": {verifier}, "resource": {f.oauth.Resource()}})
+			require.Equal(t, http.StatusOK, status, pair)
+			require.NotEmpty(t, oauthString(t, pair, "access_token"))
+		})
+	}
+}
+
+// TestOAuthExchangesWithOneDatabaseConnection uses the production UserStore and
+// UserService alongside the OAuth repository. Code and refresh exchanges must
+// reuse their transaction connection for administrator admission and finish before cancellation.
+func TestOAuthExchangesWithOneDatabaseConnection(t *testing.T) {
+	f := newOAuthFixture(t)
+	f.db.SetMaxOpenConns(1)
+	f.db.SetMaxIdleConns(1)
+	entClient := ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, f.db)))
+	users := identity.NewUserService(postgres.NewUserStore(entClient, f.db), nil, nil, nil, nil)
+	root := provider.NewMCPOAuthServer(f.repo, users, f.config, bytes.Repeat([]byte{7}, 32))
+	current, err := root.Current(t.Context())
+	require.NoError(t, err)
+	_, err = users.GetByID(t.Context(), f.userID)
+	require.NoError(t, err)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	values := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {current.Resource()}}
+	for _, grantType := range []string{"authorization_code", "refresh_token"} {
+		t.Run(grantType, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			waits := f.db.Stats().WaitCount
+			request := httptest.NewRequest(http.MethodPost, "/mcp/oauth/token", strings.NewReader(values.Encode())).WithContext(ctx)
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			current.Token(response, request)
+			require.NoError(t, ctx.Err())
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.Equal(t, waits, f.db.Stats().WaitCount)
+			var pair map[string]any
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &pair))
+			require.NotEmpty(t, oauthString(t, pair, "access_token"))
+			values = url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {oauthString(t, pair, "refresh_token")}}
+		})
+	}
 }

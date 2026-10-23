@@ -1,6 +1,12 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import McpManagementView from '../McpManagementView.vue'
+// The compiler-enabled build renders the checked-in locale strings; production
+// uses precompiled messages with the runtime-only Vue I18n alias.
+import { createI18n } from '../../../../node_modules/vue-i18n/dist/vue-i18n.mjs'
+import type { StepUpController } from '@/composables/useStepUp'
+import en from '@/i18n/locales/en/admin/mcp'
+import zh from '@/i18n/locales/zh/admin/mcp'
 
 // McpManagementView.spec.ts exercises permission selection and token creation through
 // the page's actual form events. API replacements distinguish failed writes from
@@ -37,7 +43,11 @@ vi.mock('vue-router', async (importOriginal) => ({
 }))
 vi.mock('vue-i18n', async (importOriginal) => ({
   ...(await importOriginal<typeof import('vue-i18n')>()),
-  useI18n: () => ({ t: (key: string) => key, te: () => false, locale: { value: 'en' } }),
+  useI18n: () => ({
+    t: (key: string) => (useCatalogueTranslations ? actualI18n.global.t(key) : key),
+    te: () => false,
+    locale: { value: 'en' },
+  }),
 }))
 vi.mock('@/stores/app', () => ({ useAppStore: () => ({ showSuccess: vi.fn() }) }))
 // Clipboard replacement records the exact text copied by an explicit row action.
@@ -45,10 +55,17 @@ const copyToClipboard = vi.hoisted(() => vi.fn())
 vi.mock('@/composables/useClipboard', () => ({
   useClipboard: () => ({ copyToClipboard }),
 }))
-vi.mock('@/composables/useStepUp', () => ({
-  useStepUp: () => ({ run: (action: () => Promise<void>) => action(), onCancel: vi.fn() }),
-  isStepUpCancelled: () => false,
-}))
+
+// Actual locale catalogues verify translated row status while other scenarios retain
+// key-based selectors, so their action labels stay independent of locale wording.
+const actualI18n = createI18n({
+  legacy: false,
+  locale: 'en',
+  missingWarn: false,
+  fallbackWarn: false,
+  messages: { en: { admin: en }, zh: { admin: zh } },
+})
+let useCatalogueTranslations = false
 
 // catalogue mixes routine queries, gateway writes, and sensitive actions for preset assertions.
 const catalogue = [
@@ -112,7 +129,7 @@ function page() {
         Teleport: true,
         MotionTransition: { props: ['name'], template: '<slot />' },
         ConfirmDialog: true,
-        TotpStepUpDialog: true,
+        TotpStepUpDialog: { name: 'TotpStepUpDialog', props: ['controller'], template: '<div />' },
         McpAuthorizeDialog: {
           name: 'McpAuthorizeDialog',
           props: ['show', 'requestId'],
@@ -136,9 +153,31 @@ async function clickText(wrapper: VueWrapper, label: string) {
   await button!.trigger('click')
 }
 
+// stepUpController exposes the actual verification controller passed to the dialog shell.
+function stepUpController(wrapper: VueWrapper): StepUpController {
+  return wrapper.getComponent({ name: 'TotpStepUpDialog' }).props('controller')
+}
+
+// rowFixture supplies a valid saved grant for manual-token and OAuth row scenarios.
+function rowFixture(id: number, source = '') {
+  return {
+    id,
+    source,
+    name: `Assistant ${id}`,
+    prefix: `${source || 'manual'}:${id}`,
+    permissions: ['groups.list'],
+    enabled: true,
+    skip_browser_confirmation: false,
+    expires_at: null,
+    revoked_at: null,
+    updated_at: '2026-10-23T00:00:00Z',
+  }
+}
+
 describe('MCP token management', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    useCatalogueTranslations = false
     route.query = {}
     route.name = 'AdminMCP'
     routerReplace.mockResolvedValue(undefined)
@@ -147,6 +186,183 @@ describe('MCP token management', () => {
     api.listOAuthGrants.mockResolvedValue([])
     api.getOAuthStatus.mockResolvedValue({ enabled: false, issuer: '', resource: '' })
     api.listOperations.mockResolvedValue(catalogue)
+  })
+
+  // Two different rows request verification before the first response arrives.
+  // The second request waits through the first prompt, and both rows recover after cancellation or verification.
+  it.each([
+    ['', false],
+    ['', true],
+    ['oauth', false],
+    ['oauth', true],
+  ] as const)('serializes %s row requests with verified=%s', async (source, verified) => {
+    const rows = [rowFixture(1, source), rowFixture(2, source)]
+    const update = source ? api.updateOAuthGrant : api.updateToken
+    const list = source ? api.listOAuthGrants : api.listTokens
+    list.mockResolvedValue(rows)
+    let rejectFirst!: (error: unknown) => void
+    update
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectFirst = reject)))
+      .mockRejectedValue({ code: 'STEP_UP_REQUIRED' })
+    const wrapper = page()
+    await flushPromises()
+    if (source) {
+      await wrapper.get('[data-test="scope-dropdown-trigger"]').trigger('click')
+      await wrapper.get('[data-test="scope-option-applications"]').trigger('click')
+    }
+    const buttons = wrapper.findAll('button').filter((button) => button.text() === 'keys.disable')
+    await buttons[0]!.trigger('click')
+    await buttons[1]!.trigger('click')
+    await flushPromises()
+    expect(update.mock.calls.map((call) => call[0])).toEqual([1])
+    expect(buttons.map((button) => button.attributes('disabled'))).toEqual(['', ''])
+    rejectFirst({ code: 'STEP_UP_REQUIRED' })
+    await flushPromises()
+    const controller = stepUpController(wrapper)
+    expect(controller.visible.value).toBe(true)
+    if (verified) {
+      update.mockResolvedValueOnce(rows[0])
+      controller.onVerified()
+    } else controller.onCancel()
+    await flushPromises()
+    expect(update.mock.calls.map((call) => call[0])).toEqual(verified ? [1, 1, 2] : [1, 2])
+    expect(controller.visible.value).toBe(true)
+    expect(buttons[0]!.attributes('disabled')).toBeUndefined()
+    controller.onCancel()
+    await flushPromises()
+    expect(buttons.map((button) => button.attributes('disabled'))).toEqual([undefined, undefined])
+    expect(controller.visible.value).toBe(false)
+    expect(wrapper.text()).not.toContain('step-up verification cancelled by user')
+    wrapper.unmount()
+  })
+
+  // Editing, revoking, confirmation approval, and protected downloads share the row controller.
+  // Each waits behind an in-flight row update and releases its own busy state after cancellation.
+  it.each(['edit', 'revoke', 'approve', 'download'] as const)(
+    'queues %s behind the active sensitive request',
+    async (action) => {
+      route.query = { confirmation_id: 'confirmation-one', file_id: 'archive-one' }
+      api.getConfirmation.mockResolvedValue({
+        id: 'confirmation-one',
+        state: 'pending',
+        operation: catalogue[0],
+        preview: '{}',
+      })
+      api.listTokens.mockResolvedValue([rowFixture(1), rowFixture(2)])
+      let rejectFirst!: (error: unknown) => void
+      api.updateToken
+        .mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectFirst = reject)))
+        .mockRejectedValue({ code: 'STEP_UP_REQUIRED' })
+      api.revokeToken.mockRejectedValue({ code: 'STEP_UP_REQUIRED' })
+      api.approveConfirmation.mockRejectedValue({ code: 'STEP_UP_REQUIRED' })
+      api.downloadFile.mockRejectedValue({ code: 'STEP_UP_REQUIRED' })
+      const wrapper = page()
+      await flushPromises()
+      await clickText(wrapper, 'keys.disable')
+      if (action === 'edit') {
+        await wrapper
+          .findAll('button')
+          .filter((button) => button.text() === 'common.edit')[1]!
+          .trigger('click')
+        await wrapper.get('#mcp-token-form').trigger('submit')
+      } else if (action === 'revoke') {
+        await wrapper
+          .findAll('button')
+          .filter((button) => button.text() === 'common.more')[1]!
+          .trigger('click')
+        await clickText(wrapper, 'admin.mcp.revoke')
+        wrapper.getComponent({ name: 'ConfirmDialog' }).vm.$emit('confirm')
+      } else await clickText(wrapper, `admin.mcp.${action}`)
+      await flushPromises()
+      expect(api.updateToken).toHaveBeenCalledTimes(1)
+      expect(api.revokeToken).not.toHaveBeenCalled()
+      expect(api.approveConfirmation).not.toHaveBeenCalled()
+      expect(api.downloadFile).not.toHaveBeenCalled()
+      rejectFirst({ code: 'STEP_UP_REQUIRED' })
+      await flushPromises()
+      const controller = stepUpController(wrapper)
+      controller.onCancel()
+      await flushPromises()
+      if (action === 'edit')
+        expect(api.updateToken).toHaveBeenLastCalledWith(
+          2,
+          expect.objectContaining({ expected_updated_at: '2026-10-23T00:00:00Z' }),
+        )
+      else if (action === 'revoke') expect(api.revokeToken).toHaveBeenCalledWith(2)
+      else if (action === 'approve')
+        expect(api.approveConfirmation).toHaveBeenCalledWith('confirmation-one')
+      else expect(api.downloadFile).toHaveBeenCalledWith('archive-one')
+      expect(controller.visible.value).toBe(true)
+      controller.onCancel()
+      await flushPromises()
+      expect(controller.visible.value).toBe(false)
+      expect(wrapper.text()).not.toContain('step-up verification cancelled by user')
+      expect(
+        wrapper
+          .findAll('button')
+          .filter((button) => button.text() === 'keys.disable')
+          .every((button) => button.attributes('disabled') === undefined),
+      ).toBe(true)
+      if (action === 'edit')
+        expect(wrapper.get('button[form="mcp-token-form"]').attributes('disabled')).toBeUndefined()
+      else if (action === 'revoke')
+        expect(wrapper.getComponent({ name: 'ConfirmDialog' }).props('loading')).toBe(false)
+      else
+        expect(
+          wrapper
+            .findAll('button')
+            .find((button) => button.text() === `admin.mcp.${action}`)!
+            .attributes('disabled'),
+        ).toBeUndefined()
+      wrapper.unmount()
+    },
+  )
+
+  // A removed page still has one server request and one queued row action.
+  // A late verification requirement must neither open a prompt nor send the queued mutation.
+  it('cancels queued rows when a late challenge arrives after unmount', async () => {
+    api.listTokens.mockResolvedValue([rowFixture(1), rowFixture(2)])
+    let rejectFirst!: (error: unknown) => void
+    api.updateToken.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectFirst = reject)),
+    )
+    const wrapper = page()
+    await flushPromises()
+    const buttons = wrapper.findAll('button').filter((button) => button.text() === 'keys.disable')
+    await buttons[0]!.trigger('click')
+    await buttons[1]!.trigger('click')
+    const controller = stepUpController(wrapper)
+    wrapper.unmount()
+    rejectFirst({ code: 'STEP_UP_REQUIRED' })
+    await flushPromises()
+    expect(api.updateToken).toHaveBeenCalledTimes(1)
+    expect(controller.visible.value).toBe(false)
+  })
+
+  // Disabled manual credentials and application grants share the root status key.
+  // Render both sources using each actual language catalogue so missing translations fail visibly.
+  it.each([
+    ['en', 'Disabled'],
+    ['zh', '已停用'],
+  ] as const)('renders disabled rows from the %s locale catalogue', async (locale, label) => {
+    actualI18n.global.locale.value = locale
+    useCatalogueTranslations = true
+    api.listTokens.mockResolvedValue([{ ...rowFixture(1), enabled: false }])
+    api.listOAuthGrants.mockResolvedValue([{ ...rowFixture(2, 'oauth'), enabled: false }])
+    const wrapper = page()
+    try {
+      await flushPromises()
+      expect(actualI18n.global.te('admin.mcp.disabled')).toBe(true)
+      expect(wrapper.text()).toContain(label)
+      expect(wrapper.text()).not.toContain('admin.mcp.disabled')
+      await wrapper.get('[data-test="scope-dropdown-trigger"]').trigger('click')
+      await wrapper.get('[data-test="scope-option-applications"]').trigger('click')
+      expect(wrapper.text()).toContain(label)
+      expect(wrapper.text()).not.toContain('admin.mcp.disabled')
+    } finally {
+      wrapper.unmount()
+      useCatalogueTranslations = false
+    }
   })
 
   // A selected grant becomes hidden by another search before submission. The saved

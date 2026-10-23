@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -14,15 +15,18 @@ import (
 
 // mcp_oauth.go persists OAuth client registrations, application permissions,
 // browser requests, and sanitized credential records. Exchanges run on one SQL
-// transaction carried in context. A family advisory lock precedes credential
-// reads, so refresh requests using either an old or current credential observe
-// committed rotation and revocation decisions before issuing another token.
+// transaction carried in context. Grant and family advisory locks precede final
+// credential reads, so refresh requests using either an old or current credential
+// observe committed rotation and revocation decisions before issuing another token.
 //
 // Consumed credentials remain available for replay detection until the whole
 // family expires. Revoking a family updates every credential in that family;
 // changing an application grant is independently enforced by uncached reads.
-// Existing manual MCP tokens remain in their original table and keep their
-// identifiers, ciphertext, metadata, and management interface.
+// Cleanup takes the exchange locks before rechecking family expiration, so a
+// replacement inserted by an admitted refresh retains its consumed predecessor.
+// Consent serializes its owner/client/resource tuple before looking up a grant,
+// giving concurrent first authorizations the same advisory-before-row lock order
+// as subsequent authorizations and revocations.
 
 const (
 	// Grant reads retain the shared permission shape and calculate connection expiry
@@ -33,6 +37,14 @@ const (
         WHERE s.grant_id=g.id AND s.kind IN ('refresh','access') AND s.active)
     `
 )
+
+// oauthPendingForm stores the received parameters beside their validated effective callback.
+// An omitted redirect_uri must remain omitted for code redemption, while browser
+// review and decision revalidation use the callback selected before consent began.
+type oauthPendingForm struct {
+	Parameters  url.Values `json:"parameters"`   // original validated authorization parameters
+	RedirectURI string     `json:"redirect_uri"` // validated effective callback address
+}
 
 // oauthTransactionKey isolates the exchange transaction from unrelated database contexts.
 type oauthTransactionKey struct{}
@@ -89,6 +101,15 @@ func (s *MCPOAuthStore) Transaction(ctx context.Context, fn func(context.Context
 	return tx.Commit()
 }
 
+// IsAdministrator reads current account eligibility on the exchange connection.
+// Transaction contexts keep this query on the held connection, so token issuance
+// remains possible when every connection in the pool already serves an exchange.
+func (s *MCPOAuthStore) IsAdministrator(ctx context.Context, userID int64) (bool, error) {
+	var allowed bool
+	err := s.query(ctx).QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND role='admin' AND status='active' AND deleted_at IS NULL)`, userID).Scan(&allowed)
+	return allowed, err
+}
+
 // PutClient stores validated metadata and the separate confidential-client verifier.
 // Existing DCR registrations are immutable. CIMD entries can replace cached
 // metadata only when the existing entry was also a discovered document.
@@ -125,8 +146,11 @@ func (s *MCPOAuthStore) GetClient(ctx context.Context, id string) (*identity.MCP
 }
 
 // PutPending persists validated public request parameters before exposing the browser ticket.
+// The form envelope keeps the effective callback beside the received parameters.
+// This retains omission of redirect_uri for token redemption while providing the
+// selected address for browser review and subsequent metadata revalidation.
 func (s *MCPOAuthStore) PutPending(ctx context.Context, pending *identity.MCPOAuthPending) error {
-	form, err := json.Marshal(pending.Form)
+	form, err := json.Marshal(oauthPendingForm{Parameters: pending.Form, RedirectURI: pending.RedirectURI})
 	if err != nil {
 		return err
 	}
@@ -164,6 +188,8 @@ func (s *MCPOAuthStore) ConsumePending(ctx context.Context, id string, userID in
 }
 
 // pending decodes one conditional browser-ticket mutation into its domain representation.
+// Expired, consumed, or foreign-session tickets return the same conflict. The
+// persisted envelope restores both received parameters and the selected callback.
 func (s *MCPOAuthStore) pending(ctx context.Context, query string, args ...any) (*identity.MCPOAuthPending, error) {
 	p := new(identity.MCPOAuthPending)
 	var form, client []byte
@@ -174,9 +200,12 @@ func (s *MCPOAuthStore) pending(ctx context.Context, query string, args ...any) 
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(form, &p.Form); err != nil {
+	var stored oauthPendingForm
+	if err := json.Unmarshal(form, &stored); err != nil {
 		return nil, err
 	}
+	p.Form = stored.Parameters
+	p.RedirectURI = stored.RedirectURI
 	if err := json.Unmarshal(client, &p.Client); err != nil {
 		return nil, err
 	}
@@ -188,13 +217,20 @@ func (s *MCPOAuthStore) pending(ctx context.Context, query string, args ...any) 
 // and new authorization code commit together. The live owner/client/resource tuple
 // selects the existing grant; revoked grants remain history and allow a new record.
 //
-// Existing grants take the application lock before the upsert. Previous credential
-// families are invalidated before the new code is stored, so a concurrent refresh
-// cannot survive committed reauthorization. An expired explicit grant deadline is
-// cleared when the owner authorizes that application again.
+// The owner/client/resource lock precedes lookup, including when no grant exists.
+// A concurrent first consent therefore sees the committed grant before acquiring
+// its application lock and changing its row. Previous credential families are
+// invalidated before the new code is stored, so a concurrent refresh cannot survive
+// committed reauthorization. An expired explicit grant deadline is cleared when
+// the owner authorizes that application again.
 func (s *MCPOAuthStore) SaveGrant(ctx context.Context, userID int64, client *identity.MCPOAuthClient, resource string, permissions []string) (*identity.MCPOAuthGrant, error) {
 	raw, err := json.Marshal(permissions)
 	if err != nil {
+		return nil, err
+	}
+	// Serialize first consents before lookup: otherwise an upsert can discover a
+	// concurrently created row and hold it while waiting for its grant advisory lock.
+	if _, err := s.query(ctx).ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('mcp-oauth-consent:' || jsonb_build_array($1::bigint,$2::text,$3::text)::text,0))`, userID, client.ID, resource); err != nil {
 		return nil, err
 	}
 	var id int64
@@ -362,7 +398,7 @@ func (s *MCPOAuthStore) GetSession(ctx context.Context, kind, signature string) 
 		}
 		// A family lock coordinates exchanges across rotating signatures. Re-read below
 		// observes the previous lock holder's committed invalidation before trusting this credential.
-		if _, err = q.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "mcp-oauth:"+family); err != nil {
+		if err := s.lockFamily(ctx, family); err != nil {
 			return nil, err
 		}
 	}
@@ -387,32 +423,86 @@ func (s *MCPOAuthStore) RevokeFamily(ctx context.Context, family string) error {
 }
 
 // Cleanup removes expired requests and cached client documents in bounded batches.
-// Credential deletion selects families whose latest recorded expiration has passed,
-// including the expiration of consumed records retained for replay detection.
+// Call from maintenance outside an exchange transaction.
+// Credential deletion locks each candidate family before rechecking its latest
+// expiration, including consumed records retained for replay detection.
 //
 // A consumed refresh token remains stored while any family member is unexpired.
 // This allows an old credential replay to revoke a connection that has refreshed
-// several times since that credential was consumed. Durable client registrations and application grant history are
-// retained, and a failed cleanup statement stops the pass without treating missing
-// or unreadable state as authorization.
+// several times since that credential was consumed. Each family uses a separate
+// transaction so grant locks are released before the next candidate is processed.
+// Durable client registrations and application grant history are retained, and a
+// failed cleanup statement stops the pass.
 func (s *MCPOAuthStore) Cleanup(ctx context.Context) error {
-	for _, query := range []string{
-		`DELETE FROM mcp_oauth_pending WHERE id IN (SELECT id FROM mcp_oauth_pending WHERE expires_at<NOW() LIMIT 1000)`,
-		`
-        DELETE
-        FROM mcp_oauth_sessions
-        WHERE family_id IN (SELECT family_id
-        FROM mcp_oauth_sessions
-        GROUP BY family_id
-        HAVING MAX(expires_at)<NOW()
-        LIMIT 100)
-    `,
-		`DELETE FROM mcp_oauth_clients WHERE id IN (
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM mcp_oauth_pending WHERE id IN (SELECT id FROM mcp_oauth_pending WHERE expires_at<NOW() LIMIT 1000)`); err != nil {
+		return err
+	}
+	if err := s.cleanupSessions(ctx); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM mcp_oauth_clients WHERE id IN (
             SELECT id FROM mcp_oauth_clients
             WHERE expires_at<NOW()-INTERVAL '1 day' LIMIT 1000
-        )`,
-	} {
-		if _, err := s.db.ExecContext(ctx, query); err != nil {
+	)`)
+	return err
+}
+
+// cleanupSessions removes bounded candidates after excluding concurrent renewal.
+// Candidate selection only identifies families to inspect; it cannot authorize
+// deletion because an admitted refresh may be between consumption and insertion.
+// Each candidate takes the grant lock followed by the family lock, matching
+// credential exchanges, then executes deletion in a fresh statement snapshot.
+// A replacement credential committed while cleanup waited therefore prevents
+// deletion of every older record needed to detect replay in that family.
+func (s *MCPOAuthStore) cleanupSessions(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT family_id,grant_id FROM mcp_oauth_sessions
+        GROUP BY family_id,grant_id HAVING MAX(expires_at)<NOW() LIMIT 100
+    `)
+	if err != nil {
+		return err
+	}
+	// Materialize candidates and close their cursor before transactions acquire
+	// pooled connections, so an idle candidate scan cannot exhaust a small pool.
+	defer func() { _ = rows.Close() }()
+	// candidateFamily carries the identities required to lock one cleanup candidate.
+	type candidateFamily struct {
+		family  string // Candidate credential family identifier.
+		grantID int64  // Owning application grant identifier.
+	}
+	var candidates []candidateFamily
+	for rows.Next() {
+		var candidate candidateFamily
+		if err := rows.Scan(&candidate.family, &candidate.grantID); err != nil {
+			return err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		// Separate transactions release each grant before taking another grant's
+		// lock, while deletion stays atomic with the selected family's expiry recheck.
+		if err := s.Transaction(ctx, func(ctx context.Context) error {
+			if err := s.lockGrant(ctx, candidate.grantID); err != nil {
+				return err
+			}
+			if err := s.lockFamily(ctx, candidate.family); err != nil {
+				return err
+			}
+			_, err := s.query(ctx).ExecContext(ctx, `
+                DELETE FROM mcp_oauth_sessions
+                WHERE family_id=$1 AND NOT EXISTS (
+                    SELECT 1 FROM mcp_oauth_sessions
+                    WHERE family_id=$1 AND expires_at>=NOW()
+                )
+            `, candidate.family)
+			return err
+		}); err != nil {
 			return err
 		}
 	}
@@ -430,5 +520,13 @@ func (s *MCPOAuthStore) TouchGrant(ctx context.Context, id int64) error {
 // prevents a refresh from inserting credentials after revocation scans the family.
 func (s *MCPOAuthStore) lockGrant(ctx context.Context, id int64) error {
 	_, err := s.query(ctx).ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "mcp-oauth-grant:"+strconv.FormatInt(id, 10))
+	return err
+}
+
+// lockFamily serializes rotation, replay handling, and expiration cleanup for a
+// credential family. Call inside a transaction after taking its grant lock so
+// all exchange and cleanup paths acquire shared locks in the same order.
+func (s *MCPOAuthStore) lockFamily(ctx context.Context, family string) error {
+	_, err := s.query(ctx).ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "mcp-oauth:"+family)
 	return err
 }

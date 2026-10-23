@@ -528,7 +528,7 @@ import Toggle from '@/components/common/Toggle.vue'
 import Icon from '@/components/icons/Icon.vue'
 import EndpointPopover from '@/components/keys/EndpointPopover.vue'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
-import { useStepUp, isStepUpCancelled } from '@/composables/useStepUp'
+import { useStepUp, isStepUpCancelled, StepUpCancelledError } from '@/composables/useStepUp'
 import { useClipboard } from '@/composables/useClipboard'
 import { useAppStore } from '@/stores/app'
 import * as api from '@/api/admin/mcp'
@@ -549,7 +549,9 @@ import type { MCPToken, MCPTokenInput, MCPOperation, MCPConfirmation } from '@/a
 // creation publishes its credential before refreshing the list so a later read
 // failure cannot interrupt immediate setup. Row copies fetch the complete secret
 // through an owner-authenticated endpoint and keep it local to that copy attempt.
-// Browser confirmation uses the existing TOTP flow and leaves the approved action for the agent to retry.
+// Sensitive actions share a queue from their first request through verification
+// and retry, because the TOTP controller can retain one pending decision. Browser
+// confirmation leaves the approved business action for the agent to retry.
 
 // Shared UI services supply locale, browser-route state, feedback, and strong authentication.
 const { t, locale } = useI18n()
@@ -624,6 +626,9 @@ const form = reactive({ name: '', expiry: '', enabled: true, skipBrowserConfirma
 const selected = ref(new Set<string>())
 let loadController: AbortController | null = null
 let disposed = false
+// Sensitive actions reserve this queue before contacting the server, retaining their
+// row or workflow busy state through each queued action, verification, and retry.
+let sensitiveTail: Promise<void> = Promise.resolve()
 
 // endpoint uses the validated frontend origin for both connection methods and
 // retains the browser gateway address for manual tokens when no origin is configured.
@@ -672,6 +677,39 @@ function messageOf(err: unknown, fallback: string): string {
   return err && typeof err === 'object' && 'message' in err && typeof err.message === 'string'
     ? err.message
     : fallback
+}
+
+// runSensitive serializes requests using this page's single verification dialog.
+// Callers capture request inputs before enqueueing and retain their own busy state
+// until the returned promise settles. Cancellation or failure releases the next
+// queued action, while each caller receives its own original result or error.
+//
+// Disposal rejects queued work before it contacts the server. An in-flight result
+// is also checked before the controller sees it, preventing a late verification
+// requirement from reopening a prompt after the page has already been removed.
+function runSensitive<T>(action: () => Promise<T>): Promise<T> {
+  const result = sensitiveTail.then(() =>
+    stepUp.run(async () => {
+      if (disposed) throw new StepUpCancelledError()
+      try {
+        const value = await action()
+        if (disposed) throw new StepUpCancelledError()
+        return value
+      } catch (cause) {
+        // A late server challenge belongs to the removed page; convert it before
+        // useStepUp can create a fresh prompt that no mounted dialog can settle.
+        if (disposed) throw new StepUpCancelledError()
+        throw cause
+      }
+    }),
+  )
+  // The tail tracks settlement only, so one failed or cancelled action cannot
+  // reject later queue entries; the caller still receives the unmodified result.
+  sensitiveTail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
 }
 
 // load fetches the token list, operation catalogue, and optional browser review for the
@@ -840,6 +878,7 @@ function closeEditor() {
 async function save() {
   const tokenID = editingID.value
   const source = editingSource.value
+  const expectedUpdatedAt = editingVersion.value
   const busyKey = `${source}:${tokenID}`
   if (saving.value || (tokenID !== null && busyTokens.value.has(busyKey))) return
   if (tokenID !== null) busyTokens.value.add(busyKey)
@@ -854,10 +893,10 @@ async function save() {
       expires_at: form.expiry ? new Date(form.expiry).toISOString() : null,
     }
     if (tokenID !== null)
-      await stepUp.run(() =>
+      await runSensitive(() =>
         source === 'oauth'
-          ? api.updateOAuthGrant(tokenID, { ...input, expected_updated_at: editingVersion.value })
-          : api.updateToken(tokenID, { ...input, expected_updated_at: editingVersion.value }),
+          ? api.updateOAuthGrant(tokenID, { ...input, expected_updated_at: expectedUpdatedAt })
+          : api.updateToken(tokenID, { ...input, expected_updated_at: expectedUpdatedAt }),
       )
     else {
       const created = await api.createToken(input)
@@ -867,7 +906,9 @@ async function save() {
     app.showSuccess(t('admin.mcp.saved'))
     await load()
   } catch (err) {
-    formError.value = messageOf(err, t('admin.mcp.saveFailed'))
+    // Cancelling verification leaves the editor available for another deliberate
+    // save, so the controller's cancellation sentinel is not user-facing feedback.
+    if (!isStepUpCancelled(err)) formError.value = messageOf(err, t('admin.mcp.saveFailed'))
   } finally {
     // Release this token only after its own mutation and list readback settle;
     // other rows keep their independent locks during concurrent operations.
@@ -883,7 +924,7 @@ async function toggleToken(token: MCPToken, enabled: boolean) {
   if (busyTokens.value.has(tokenKey(token))) return
   busyTokens.value.add(tokenKey(token))
   try {
-    await stepUp.run(() =>
+    await runSensitive(() =>
       (token.source === 'oauth' ? api.updateOAuthGrant : api.updateToken)(token.id, {
         name: token.name,
         permissions: token.permissions,
@@ -895,7 +936,9 @@ async function toggleToken(token: MCPToken, enabled: boolean) {
     )
     await load()
   } catch (err) {
-    error.value = messageOf(err, t('admin.mcp.saveFailed'))
+    // Cancelling this queued action releases its row without displaying an
+    // internal verification sentinel as though the server rejected the update.
+    if (!isStepUpCancelled(err)) error.value = messageOf(err, t('admin.mcp.saveFailed'))
   } finally {
     busyTokens.value.delete(tokenKey(token))
   }
@@ -909,13 +952,15 @@ async function revoke() {
   if (!token || busyTokens.value.has(tokenKey(token))) return
   busyTokens.value.add(tokenKey(token))
   try {
-    await stepUp.run(() =>
+    await runSensitive(() =>
       (token.source === 'oauth' ? api.revokeOAuthGrant : api.revokeToken)(token.id),
     )
     revoking.value = null
     await load()
   } catch (err) {
-    error.value = messageOf(err, t('admin.mcp.requestFailed'))
+    // A cancelled verification leaves the revoke selection intact so the user
+    // can retry deliberately, without showing the controller's internal sentinel.
+    if (!isStepUpCancelled(err)) error.value = messageOf(err, t('admin.mcp.requestFailed'))
   } finally {
     busyTokens.value.delete(tokenKey(token))
   }
@@ -929,7 +974,7 @@ async function approve() {
   const id = confirmation.value.id
   approving.value = true
   try {
-    await stepUp.run(() => api.approveConfirmation(id))
+    await runSensitive(() => api.approveConfirmation(id))
     await load()
   } catch (err) {
     if (!isStepUpCancelled(err)) error.value = messageOf(err, t('admin.mcp.requestFailed'))
@@ -942,9 +987,11 @@ async function approve() {
 // A renewed browser grant applies to the retried archive request. Cancellation
 // leaves the protected link available until its server-managed expiry.
 async function download() {
+  if (downloading.value) return
+  const id = fileID.value
   downloading.value = true
   try {
-    const file = await stepUp.run(() => api.downloadFile(fileID.value))
+    const file = await runSensitive(() => api.downloadFile(id))
     saveAs(file.blob, file.filename)
   } catch (err) {
     if (!isStepUpCancelled(err)) error.value = messageOf(err, t('admin.mcp.requestFailed'))

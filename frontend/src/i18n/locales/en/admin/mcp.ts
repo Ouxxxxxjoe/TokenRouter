@@ -125,6 +125,7 @@ export default {
     never: 'No expiry',
     lastUsed: 'Last used',
     unused: 'Not used yet',
+    disabled: 'Disabled',
     active: 'Active',
     expired: 'Expired',
     revoked: 'Revoked',
