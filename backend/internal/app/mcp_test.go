@@ -60,17 +60,6 @@ func TestMCPArtifactCipherUsesDurableOAuthKey(t *testing.T) {
 	require.Error(t, err)
 }
 
-// GetMultiple returns requested OAuth configuration values from the fixture store.
-func (s *mcpSettingsFixture) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
-	values := map[string]string{}
-	for _, key := range keys {
-		if value, ok := s.values[key]; ok {
-			values[key] = value
-		}
-	}
-	return values, s.err
-}
-
 // GetValue reads one fixture setting and distinguishes absence from storage failure.
 // Missing keys return the production absence sentinel, allowing the assembled
 // browser-origin reader to skip unconfigured URLs while keeping saved addresses.
@@ -84,55 +73,33 @@ func (s *mcpSettingsFixture) GetValue(_ context.Context, key string) (string, er
 	return "", settings.ErrSettingNotFound
 }
 
-// Set persists a fixture value unless a storage failure is injected.
-// A configured failure leaves saved values intact so tests can inspect the
-// previously confirmed switch after a rejected write.
-func (s *mcpSettingsFixture) Set(_ context.Context, key, value string) error {
-	if s.err != nil {
-		return s.err
-	}
-	s.values[key] = value
-	return nil
-}
-
 // TestMCPOAuthUsesFrontendSettings verifies the upgrade path with existing site configuration.
 // Database frontend values override deployment defaults, API display URLs are
 // ignored, and storage failure cannot activate a different fallback origin.
 func TestMCPOAuthUsesFrontendSettings(t *testing.T) {
 	repo := &mcpSettingsFixture{values: map[string]string{"api_base_url": "https://api.example"}}
-	adapter := &mcpOAuthSettings{store: settings.New(repo), frontendURL: "https://deployment.example"}
-	config, err := adapter.Read(t.Context())
+	adapter := &mcpOAuthFrontend{store: settings.New(repo), frontendURL: "https://deployment.example"}
+	frontend, err := adapter.FrontendURL(t.Context())
 	require.NoError(t, err)
-	require.True(t, config.Enabled)
-	require.Equal(t, "https://deployment.example", config.FrontendURL)
+	require.Equal(t, "https://deployment.example", frontend)
 	repo.values["frontend_url"] = " https://site.example "
-	config, err = adapter.Read(t.Context())
+	frontend, err = adapter.FrontendURL(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, "https://site.example", config.FrontendURL)
-	require.NoError(t, adapter.SetEnabled(t.Context(), false))
-	config, err = adapter.Read(t.Context())
-	require.NoError(t, err)
-	require.False(t, config.Enabled)
+	require.Equal(t, "https://site.example", frontend)
 	repo.err = errors.New("database unavailable")
-	_, err = adapter.Read(t.Context())
+	_, err = adapter.FrontendURL(t.Context())
 	require.ErrorIs(t, err, repo.err)
-	require.ErrorIs(t, adapter.SetEnabled(t.Context(), true), repo.err)
-	require.Equal(t, "false", repo.values["mcp_oauth_enabled"])
-	repo.err = nil
-	repo.values["mcp_oauth_enabled"] = "invalid"
-	_, err = adapter.Read(t.Context())
-	require.Error(t, err)
 }
 
-// TestMCPBrowserOriginSurvivesOAuthDisable uses the deployment frontend URL with OAuth off.
-// The configured browser origin must still reach manual-token authentication;
-// disabling OAuth must not turn a previously trusted browser into a forbidden origin.
-func TestMCPBrowserOriginSurvivesOAuthDisable(t *testing.T) {
-	repo := &mcpSettingsFixture{values: map[string]string{"mcp_oauth_enabled": "false"}}
+// TestMCPBrowserOriginUsesFrontendURL assembles the transport with a deployment site address.
+// The configured browser must reach credential authentication, and the challenge
+// must advertise discovery at that same public origin.
+func TestMCPBrowserOriginUsesFrontendURL(t *testing.T) {
+	repo := &mcpSettingsFixture{values: map[string]string{}}
 	store := settings.New(repo)
 	cfg := &config.Config{MCPOAuthSigningSecret: strings.Repeat("ab", 32)}
 	cfg.Server.FrontendURL = "https://frontend.example"
-	oauth := identityprovider.NewMCPOAuthServer(nil, nil, &mcpOAuthSettings{store: store, frontendURL: cfg.Server.FrontendURL}, bytes.Repeat([]byte{4}, 32))
+	oauth := identityprovider.NewMCPOAuthServer(nil, nil, &mcpOAuthFrontend{store: store, frontendURL: cfg.Server.FrontendURL}, bytes.Repeat([]byte{4}, 32))
 	handler, err := provideMCPHTTP(oauth, nil, nil, nil, nil, nil, nil, store, cfg)
 	require.NoError(t, err)
 	router := gin.New()
@@ -142,5 +109,5 @@ func TestMCPBrowserOriginSurvivesOAuthDisable(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	require.Equal(t, http.StatusUnauthorized, response.Code)
-	require.Equal(t, "Bearer", response.Header().Get("WWW-Authenticate"))
+	require.Contains(t, response.Header().Get("WWW-Authenticate"), "https://frontend.example/.well-known/oauth-protected-resource/mcp")
 }

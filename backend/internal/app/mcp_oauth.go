@@ -4,9 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,8 +21,8 @@ import (
 // mcp_oauth.go assembles the OAuth protocol service and expired-state cleanup.
 // Bootstrap supplies an independent persisted signing secret so backend
 // restarts can verify existing opaque credentials. The existing
-// frontend URL controls the public issuer, and the saved connection switch
-// controls availability. Grant management remains available while disabled.
+// frontend URL determines the public issuer and protocol availability. Grant
+// management remains available while the address is missing or invalid.
 //
 // Cleanup starts under the application lifecycle and stops before database
 // shutdown. Each pass has a bounded context, and shutdown cancels an active
@@ -30,10 +30,10 @@ import (
 // records while another family member remains unexpired, preserving replay
 // detection across access-token renewal and process restarts.
 
-// mcpOAuthSettings reads the site address and connection switch as one database view.
+// mcpOAuthFrontend reads the existing site address for OAuth protocol requests.
 // The deployment frontend URL supplies the existing default when no nonblank
 // database address exists. Read errors remain failures rather than changing origins.
-type mcpOAuthSettings struct {
+type mcpOAuthFrontend struct {
 	store       *settings.Store // Authoritative site settings store.
 	frontendURL string          // Deployment frontend address default.
 }
@@ -53,7 +53,7 @@ func provideMCPOAuth(db *sql.DB, users *identity.UserService, cfg *config.Config
 	if err != nil || len(secret) != 32 {
 		return nil, fmt.Errorf("MCP OAuth signing secret is unavailable")
 	}
-	server := identityprovider.NewMCPOAuthServer(repo, users, &mcpOAuthSettings{store: store, frontendURL: cfg.Server.FrontendURL}, secret)
+	server := identityprovider.NewMCPOAuthServer(repo, users, &mcpOAuthFrontend{store: store, frontendURL: cfg.Server.FrontendURL}, secret)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	manager.Register(lifecycle.Hook{
@@ -94,31 +94,16 @@ func provideMCPOAuth(db *sql.DB, users *identity.UserService, cfg *config.Config
 	return server, nil
 }
 
-// Read resolves the existing frontend address and default-enabled OAuth switch.
-// Both stored values come from one read; database failures prevent protocol
-// admission. An absent switch permits connections once a valid address exists.
-func (s *mcpOAuthSettings) Read(ctx context.Context) (identityprovider.MCPOAuthConfiguration, error) {
-	values, err := s.store.GetMultiple(ctx, []string{"frontend_url", "mcp_oauth_enabled"})
-	if err != nil {
-		return identityprovider.MCPOAuthConfiguration{}, err
+// FrontendURL resolves the stored site address or the existing deployment default.
+// A missing or blank setting uses the deployment frontend URL. Storage failures
+// remain errors so OAuth cannot switch origins during a transient database failure.
+func (s *mcpOAuthFrontend) FrontendURL(ctx context.Context) (string, error) {
+	value, err := s.store.GetValue(ctx, "frontend_url")
+	if err != nil && !errors.Is(err, settings.ErrSettingNotFound) {
+		return "", err
 	}
-	frontend := strings.TrimSpace(values["frontend_url"])
-	if frontend == "" {
-		frontend = s.frontendURL
+	if value = strings.TrimSpace(value); value != "" {
+		return value, nil
 	}
-	enabled := true
-	if raw, exists := values["mcp_oauth_enabled"]; exists {
-		enabled, err = strconv.ParseBool(raw)
-		if err != nil {
-			return identityprovider.MCPOAuthConfiguration{}, fmt.Errorf("invalid OAuth connection setting: %w", err)
-		}
-	}
-	return identityprovider.MCPOAuthConfiguration{FrontendURL: frontend, Enabled: enabled}, nil
-}
-
-// SetEnabled persists the browser administrator's OAuth connection preference.
-// Protocol requests read this value directly on their next admission, so a
-// successful write takes effect without restarting the backend or changing addresses.
-func (s *mcpOAuthSettings) SetEnabled(ctx context.Context, enabled bool) error {
-	return s.store.Set(ctx, "mcp_oauth_enabled", strconv.FormatBool(enabled))
+	return s.frontendURL, nil
 }

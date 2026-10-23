@@ -38,7 +38,7 @@ func TestOAuthFrontendAddressValidation(t *testing.T) {
 		{"//site.example", "", "frontend_url_invalid"},
 	}
 	for _, tc := range cases {
-		settings := &oauthSettingsFixture{value: MCPOAuthConfiguration{FrontendURL: tc.url, Enabled: true}}
+		settings := &oauthFrontendFixture{url: tc.url}
 		server := NewMCPOAuthServer(nil, nil, settings, bytes.Repeat([]byte{3}, 32))
 		status, err := server.Status(t.Context())
 		require.NoError(t, err, tc.url)
@@ -49,24 +49,24 @@ func TestOAuthFrontendAddressValidation(t *testing.T) {
 }
 
 // TestOAuthRequestsResolveCurrentFrontend captures a request before changing settings.
-// New requests observe the new origin or disabled switch, while the captured
+// New requests observe the new or missing origin, while the captured
 // request retains internally consistent discovery and token metadata.
 func TestOAuthRequestsResolveCurrentFrontend(t *testing.T) {
-	settings := &oauthSettingsFixture{value: MCPOAuthConfiguration{FrontendURL: "https://first.example", Enabled: true}}
+	settings := &oauthFrontendFixture{url: "https://first.example"}
 	server := NewMCPOAuthServer(nil, nil, settings, bytes.Repeat([]byte{4}, 32))
 	first, err := server.Current(t.Context())
 	require.NoError(t, err)
-	settings.value.FrontendURL = "https://second.example"
+	settings.url = "https://second.example"
 	second, err := server.Current(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "https://first.example", first.Metadata()["issuer"])
 	require.Equal(t, "https://second.example", second.Metadata()["issuer"])
 	require.Equal(t, "https://second.example/mcp", second.Resource())
-	status, err := server.SetEnabled(t.Context(), false)
+	settings.url = ""
+	status, err := server.Status(t.Context())
 	require.NoError(t, err)
 	require.False(t, status.Enabled)
-	require.False(t, status.Allowed)
-	require.Equal(t, "disabled", status.Reason)
+	require.Equal(t, "frontend_url_missing", status.Reason)
 	_, err = server.Current(t.Context())
 	require.Error(t, err)
 	_, err = server.AuthorizeGrant(t.Context(), 1)

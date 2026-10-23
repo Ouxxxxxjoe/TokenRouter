@@ -444,19 +444,7 @@
       @close="connectionOpen = false"
     >
       <div class="mb-5 space-y-3">
-        <div class="flex items-center justify-between gap-4">
-          <label class="font-medium" for="mcp-oauth-enabled">{{
-            t('admin.mcp.oauth.connectionTitle')
-          }}</label>
-          <Toggle
-            id="mcp-oauth-enabled"
-            :model-value="oauthStatus?.allowed ?? false"
-            :disabled="oauthSaving || loading || !oauthStatus"
-            size="sm"
-            :aria-label="t('admin.mcp.oauth.allowConnections')"
-            @update:model-value="setOAuthEnabled"
-          />
-        </div>
+        <h3 class="font-medium">{{ t('admin.mcp.oauth.connectionTitle') }}</h3>
         <p class="text-sm text-gray-600 dark:text-gray-400">{{ oauthConnectionHint }}</p>
         <code
           v-if="oauthStatus?.enabled"
@@ -472,9 +460,6 @@
           class="text-sm text-primary-600 hover:underline dark:text-primary-400"
           >{{ t('admin.mcp.oauth.siteSettings') }}</RouterLink
         >
-        <p v-if="oauthError" class="text-sm text-red-600 dark:text-red-400" role="alert">{{
-          oauthError
-        }}</p>
       </div>
       <h3 class="mb-2 font-medium">{{ t('admin.mcp.oauth.tokens') }}</h3>
       <pre
@@ -597,10 +582,8 @@ watch(
   },
   { immediate: true },
 )
-// Connection feedback retains confirmed settings until the browser's switch write succeeds.
+// Connection guidance explains whether the current frontend address supports OAuth access.
 const oauthStatus = ref<api.MCPOAuthStatus | null>(null)
-const oauthSaving = ref(false)
-const oauthError = ref('')
 const oauthConnectionHint = computed(() => {
   if (!oauthStatus.value) return t('admin.mcp.oauth.statusUnavailable')
   if (oauthStatus.value.enabled) return t('admin.mcp.oauth.connectionHint')
@@ -608,7 +591,7 @@ const oauthConnectionHint = computed(() => {
     return t('admin.mcp.oauth.frontendMissing')
   if (oauthStatus.value.reason === 'frontend_url_invalid')
     return t('admin.mcp.oauth.frontendInvalid')
-  return t('admin.mcp.oauth.disabled')
+  return t('admin.mcp.oauth.statusUnavailable')
 })
 const editingSource = ref('')
 const operations = ref<MCPOperation[]>([])
@@ -642,8 +625,8 @@ const selected = ref(new Set<string>())
 let loadController: AbortController | null = null
 let disposed = false
 
-// endpoint uses the validated frontend origin for both connection methods, including
-// when OAuth connections are disabled and manual tokens remain available.
+// endpoint uses the validated frontend origin for both connection methods and
+// retains the browser gateway address for manual tokens when no origin is configured.
 const endpoint = computed(() => oauthStatus.value?.resource || buildGatewayUrl('/mcp'))
 const fileID = computed(() => (typeof route.query.file_id === 'string' ? route.query.file_id : ''))
 const visibleTokens = computed(() =>
@@ -700,7 +683,7 @@ function messageOf(err: unknown, fallback: string): string {
 // message. Component disposal aborts the remaining reads, and only the current controller
 // can clear loading after its request group settles.
 async function load() {
-  if (disposed || oauthSaving.value) return
+  if (disposed) return
   loadController?.abort()
   const controller = new AbortController()
   loadController = controller
@@ -1018,27 +1001,6 @@ function connectionText(secret = '<MCP_ACCESS_TOKEN>'): string {
 // clearCredential removes the only complete credential retained by this mounted page.
 function clearCredential() {
   credential.value = ''
-}
-
-// setOAuthEnabled publishes a connection preference only after its verified write succeeds.
-// Failed writes keep the confirmed switch position and show feedback inside the
-// connection dialog. Refresh and switch writes exclude one another so a stale
-// list response cannot replace the newly saved preference. Disposal prevents a
-// late response from restoring page state. Cancelling two-factor verification
-// leaves the saved preference and its current display unchanged.
-async function setOAuthEnabled(enabled: boolean) {
-  if (oauthSaving.value || loading.value || !oauthStatus.value) return
-  oauthSaving.value = true
-  oauthError.value = ''
-  try {
-    const result = await stepUp.run(() => api.setOAuthEnabled(enabled))
-    if (!disposed) oauthStatus.value = result
-  } catch (err) {
-    if (!disposed && !isStepUpCancelled(err))
-      oauthError.value = messageOf(err, t('admin.mcp.saveFailed'))
-  } finally {
-    oauthSaving.value = false
-  }
 }
 
 // closeAuthorization returns an expired or dismissed workflow to MCP management.

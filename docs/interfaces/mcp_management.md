@@ -58,7 +58,7 @@ JSON 响应提供共享 HTTP envelope schema；已声明的具体响应 DTO 会�
 <a id="oauth_authorization"></a>
 ## OAuth 应用授权
 
-OAuth 直接复用站点的 `frontend_url`：后台保存的非空地址优先，未填写时使用部署配置 `server.frontend_url`。地址须为 HTTPS origin，不含路径、用户信息、查询或片段；回环 HTTP 用于本地开发。尾部根斜杠会规范化。没有单独的 OAuth 地址或覆盖配置，`api_base_url`、请求 Host 和代理头不参与地址生成。OAuth 连接开关默认开启；地址缺失或无效时，状态接口说明原因，协议请求拒绝准入，手工 Token 继续工作。
+OAuth 直接复用站点的 `frontend_url`：后台保存的非空地址优先，未填写时使用部署配置 `server.frontend_url`。地址须为 HTTPS origin，不含路径、用户信息、查询或片段；回环 HTTP 用于本地开发。尾部根斜杠会规范化。没有单独的 OAuth 地址或覆盖配置，`api_base_url`、请求 Host 和代理头不参与地址生成。有效前端地址使 OAuth 自动可用；地址缺失或无效时，状态接口说明原因，协议请求拒绝准入，手工 Token 继续工作。
 
 资源发现提供 `/.well-known/oauth-protected-resource/mcp` 和无 `/mcp` 后缀的兼容入口；授权发现位于 `/.well-known/oauth-authorization-server`。`/mcp/oauth` 下的 `authorize`、`token`、`register` 和 `revoke` 分别处理授权、换票/刷新、DCR 和撤销。这些端点使用 OAuth JSON；管理页接口仍使用 HTTP envelope。OAuth 可用时，未认证的 `/mcp` 请求通过 `WWW-Authenticate` 公布资源元数据地址。
 
@@ -68,13 +68,13 @@ OAuth 直接复用站点的 `frontend_url`：后台保存的非空地址优先�
 
 管理员通过 `/admin/mcp/authorize` 登录后，在 MCP 管理页的授权弹窗中决定授权。有效请求关闭时提交拒绝，过期或失败的流程可关闭并返回管理列表。十分钟请求绑定当前管理员及 JWT session，决定提交还需 session-bound nonce。首次默认勾选安全只读预设；已有应用展示当前权限，新增操作不会自动加入。批准使用现有近期 TOTP 策略，拒绝不要求 step-up。确认请求只能消费一次，客户端不能替用户批准。
 
-每次 OAuth 请求和稳定授权检查读取当前站点地址及开关；同一次协议交换使用固定的地址快照。修改前端 origin 后，旧地址的授权码、access token、refresh token 和待授权请求不能用于新地址，客户端需要重新连接，应用列表会显示需要重新连接。关闭开关立即影响后续 OAuth 请求、确认及文件下载，重新开启后仍在有效期内的同地址凭据可以继续使用。读取设置失败时拒绝 OAuth 准入。
+每次 OAuth 请求和稳定授权检查读取当前站点地址；同一次协议交换使用固定的地址快照。修改前端 origin 后，旧地址的授权码、access token、refresh token 和待授权请求不能用于新地址，客户端需要重新连接，应用列表会显示需要重新连接。读取设置失败时拒绝 OAuth 准入。
 
 授权码有效期五分钟，access token 有效期十五分钟，refresh token 每次使用后轮换并续期三十天。应用授权默认无固定期限，连续三十天未刷新需要重新连接。授权与 token 原文分开存储，OAuth token 不提供浏览器复制功能。重用已消费的 refresh token 会撤销其整个凭据族；其他应用和手工令牌不受该次撤销影响。
 
 应用授权采用稳定 ID。请求、限流、内部 dispatch、确认及文件同时使用来源类型和 ID 区分手工令牌与 OAuth，旧 Redis 记录缺少来源时视为手工令牌。刷新不改变授权 ID 或配置版本；修改权限会使旧浏览器确认失效。后续请求和下载复查当前授权、用户状态和管理员角色。相同客户端重新授权时更新存量授权并撤销旧凭据族，已永久撤销的记录保持历史，新连接创建新记录。
 
-浏览器管理入口位于 `/api/v1/admin/mcp/oauth`：`GET /status` 查询接入状态，`PUT /status` 修改连接开关，`GET /requests/:id` 和 `POST /requests/:id/decision` 完成授权，`GET /grants`、`PUT /grants/:id` 和 `DELETE /grants/:id` 管理应用。所有入口要求管理员 JWT 会话，修改开关遵循近期 TOTP 规则。状态中的 `allowed` 表示保存的开关，`enabled` 表示地址和开关共同决定的可用性，`reason` 区分地址缺失、地址无效和关闭状态。应用授权更新携带 `expected_updated_at`，防止旧草稿覆盖并发修改。
+浏览器管理入口位于 `/api/v1/admin/mcp/oauth`：`GET /status` 查询接入状态，`GET /requests/:id` 和 `POST /requests/:id/decision` 完成授权，`GET /grants`、`PUT /grants/:id` 和 `DELETE /grants/:id` 管理应用。所有入口要求管理员 JWT 会话。状态中的 `enabled` 表示 OAuth 是否可用，`reason` 区分地址缺失和地址无效。应用授权更新携带 `expected_updated_at`，防止旧草稿覆盖并发修改。
 
 Fosite 负责协议验证，identity/provider 负责 MCP resource、CIMD 和浏览器授权编排，identity/postgres 负责事务与持久化。迁移 302 增加 OAuth 表，独立签名密钥通过 `security_secrets` 持久化。未配置固定 TOTP 加密密钥时，OAuth 部署从持久签名密钥通过独立 HKDF 上下文派生临时文件的 AES 密钥，使后端重启后能解密仍有效的 Redis 文件；已配置固定 TOTP 密钥的部署沿用该密钥。授权码消费、刷新轮换和应用重新授权在事务中完成；重放拒绝会提交撤销结果，其他交换失败回滚。清理任务每小时删除过期请求和完全过期的凭据族，已消费刷新记录保留至整个族过期，以便检测旧凭据重放。
 

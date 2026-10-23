@@ -118,7 +118,7 @@ Apple container 的新栈使用 `org.tokenrouter.stack` 标签；已有的 `sub2
 
 ### MCP OAuth 部署
 
-迁移 302 创建 OAuth 客户端、应用授权、短期请求和凭据表。单实例部署同步升级前后端；已有有效 `frontend_url` 的部署默认允许 OAuth 连接，无需新增环境变量。地址缺失或无效时，在原系统设置中补全前端地址即可，无需重启。管理员可以在 MCP 接入配置中关闭 OAuth，手工 Token 表及接入方式保持原结构。
+迁移 302 创建 OAuth 客户端、应用授权、短期请求和凭据表。单实例部署同步升级前后端；已有有效 `frontend_url` 的部署升级后即可使用 OAuth，无需新增环境变量。地址缺失或无效时，在原系统设置中补全前端地址即可，无需重启。MCP 接入配置显示当前地址或需要修正的原因，手工 Token 表及接入方式保持原结构。
 
 `frontend_url` 对应的公开入口必须将 `/mcp`、`/mcp/oauth/*` 和 `/.well-known/oauth-*` 转发到后端，并提供 `/admin/mcp/authorize` 网页。即使前后端物理分开部署，也使用这个统一公开入口。嵌入前端的发行构建保留这些后端路径；跨域浏览器接入按 CORS 配置放行 Origin，并暴露 `WWW-Authenticate`。
 

@@ -45,19 +45,6 @@ var oauthOperations = map[string]*adminapi.Operation{
 		BrowserPath: "/admin/mcp",
 		Input:       adminapi.Arguments("/api/v1/admin/mcp/oauth/status", nil, nil),
 	}),
-	"configure": adminapi.Define(adminapi.Operation{
-		ID:          "mcp.oauth.configure",
-		Module:      "mcp",
-		Title:       "Configure OAuth connections",
-		TitleZH:     "设置 OAuth 连接开关",
-		Description: "Enable or disable OAuth connections in the administrator browser.",
-		Method:      "PUT",
-		Path:        "/api/v1/admin/mcp/oauth/status",
-		Sensitive:   true,
-		Response:    adminapi.ResponseBrowser,
-		BrowserPath: "/admin/mcp",
-		Input:       adminapi.Arguments("/api/v1/admin/mcp/oauth/status", nil, (*oauthConfiguration)(nil)),
-	}),
 	"requests.get": adminapi.Define(adminapi.Operation{
 		ID:          "mcp.oauth.requests.get",
 		Module:      "mcp",
@@ -131,20 +118,12 @@ type oauthDecision struct {
 	Permissions []string `json:"permissions"` // selected exact operation identifiers
 }
 
-// oauthConfiguration carries the administrator's explicit connection availability choice.
-type oauthConfiguration struct {
-	// Enabled is required; nil distinguishes a missing body property from an
-	// explicit false, so an incomplete request cannot accidentally disable connections.
-	Enabled *bool `json:"enabled"` // Required connection switch value.
-}
-
 // mountOAuth registers protocol and browser routes independently of current availability.
 // Each protocol request resolves the current site settings before parsing OAuth
-// parameters. This allows administrators to configure the frontend URL or switch
-// connections on without restarting the backend or rebuilding the route table.
+// parameters. Configuring the existing frontend URL makes OAuth available
+// without restarting the backend or rebuilding the route table.
 func (h *Handler) mountOAuth(router *gin.Engine, group *gin.RouterGroup) {
 	adminapi.Register(group, oauthOperations["status"], h.oauthStatus)
-	adminapi.Register(group, oauthOperations["configure"], h.oauthConfigure)
 	adminapi.Register(group, oauthOperations["requests.get"], h.oauthReview)
 	adminapi.Register(group, oauthOperations["requests.decide"], h.oauthDecide)
 	adminapi.Register(group, oauthOperations["grants.list"], h.oauthGrants)
@@ -173,7 +152,7 @@ func (h *Handler) mountOAuth(router *gin.Engine, group *gin.RouterGroup) {
 }
 
 // oauthProtocol binds one site's current origin for the entire protocol response.
-// Disabled settings and read failures produce a standard OAuth error before
+// Unavailable addresses and read failures produce a standard OAuth error before
 // invoking the protocol callback; the route never falls through to SPA content.
 func (h *Handler) oauthProtocol(handle func(*provider.MCPOAuthServer, *gin.Context)) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -248,33 +227,13 @@ func (h *Handler) oauthBrowser(c *gin.Context) bool {
 }
 
 // oauthStatus reports current frontend-derived availability and address validation feedback.
-// Settings read failures remain errors instead of masquerading as a disabled
-// switch, allowing the browser to retain its last confirmed connection state.
+// Address read failures remain errors instead of masquerading as an unconfigured
+// site, allowing the browser to retain its last confirmed connection state.
 func (h *Handler) oauthStatus(c *gin.Context) {
 	if !h.oauthBrowser(c) {
 		return
 	}
 	status, err := h.options.OAuth.Status(c.Request.Context())
-	if err != nil {
-		httpx.ErrorFrom(c, err)
-		return
-	}
-	httpx.Success(c, status)
-}
-
-// oauthConfigure persists the administrator's connection switch after recent verification.
-// Missing values and nonbrowser credentials are rejected before changing settings.
-// The response contains the validated status used by subsequent OAuth requests.
-func (h *Handler) oauthConfigure(c *gin.Context) {
-	if !h.oauthBrowser(c) || !h.checkBrowserStepUp(c) {
-		return
-	}
-	var input oauthConfiguration
-	if httpx.BindJSONStrict(c, &input) != nil || input.Enabled == nil {
-		httpx.BadRequest(c, "Specify whether OAuth connections are enabled")
-		return
-	}
-	status, err := h.options.OAuth.SetEnabled(c.Request.Context(), *input.Enabled)
 	if err != nil {
 		httpx.ErrorFrom(c, err)
 		return

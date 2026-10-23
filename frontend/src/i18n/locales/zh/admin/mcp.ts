@@ -25,8 +25,6 @@ export default {
       reconnect: '需要重新连接',
       connectionTitle: '通过 OAuth 连接',
       connectionHint: '在客户端填写此 MCP 地址并选择 OAuth，登录后确认应用及其访问权限。',
-      disabled: 'OAuth 连接已关闭，手工令牌仍可使用。',
-      allowConnections: '允许 OAuth 连接',
       frontendMissing: '请先在系统设置中填写前端地址，OAuth 将使用这个站点地址。',
       frontendInvalid:
         '前端地址需要是公开 HTTPS 地址，不能包含路径、查询参数或片段。本地开发可使用回环 HTTP 地址。',
@@ -121,7 +119,6 @@ export default {
     lastUsed: '最近使用',
     unused: '尚未使用',
     active: '已启用',
-    disabled: '已停用',
     expired: '已过期',
     revoked: '已撤销',
     revoke: '撤销',

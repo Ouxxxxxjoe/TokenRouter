@@ -40,9 +40,9 @@ type MCPOAuthServer struct {
 	repo   identity.MCPOAuthRepository // durable OAuth exchange repository
 	users  identity.MCPUserReader      // current administrator account reader
 	issuer string                      // canonical frontend origin for this request
-	// settings belongs to the root service; request instances clear it after
+	// frontend belongs to the root service; request instances clear it after
 	// binding an origin so nested storage calls retain the same configuration.
-	settings   MCPOAuthSettings
+	frontend   MCPOAuthFrontend
 	secret     []byte                // independent persisted signing secret
 	protocol   fosite.OAuth2Provider // enabled OAuth protocol handlers
 	clientHTTP *http.Client          // bounded SSRF-protected metadata client
@@ -55,12 +55,12 @@ type MCPOAuthReview struct {
 	Grant   *identity.MCPOAuthGrant   `json:"grant"`   // previous live application authorization
 }
 
-// NewMCPOAuthServer binds live site settings and persistent OAuth credentials.
+// NewMCPOAuthServer binds the frontend address reader and persistent OAuth credentials.
 // Current resolves an immutable protocol instance for each incoming request.
-// The settings source must remain available throughout the server lifetime;
+// The address reader must remain available throughout the server lifetime;
 // failed reads deny OAuth access while grant management remains available.
-func NewMCPOAuthServer(repo identity.MCPOAuthRepository, users identity.MCPUserReader, settings MCPOAuthSettings, secret []byte) *MCPOAuthServer {
-	return &MCPOAuthServer{repo: repo, users: users, settings: settings, secret: append([]byte(nil), secret...), clientHTTP: newCIMDHTTPClient()}
+func NewMCPOAuthServer(repo identity.MCPOAuthRepository, users identity.MCPUserReader, frontend MCPOAuthFrontend, secret []byte) *MCPOAuthServer {
+	return &MCPOAuthServer{repo: repo, users: users, frontend: frontend, secret: append([]byte(nil), secret...), clientHTTP: newCIMDHTTPClient()}
 }
 
 // enableProtocol binds Fosite to this request's resolved frontend origin.
@@ -87,8 +87,8 @@ func (s *MCPOAuthServer) Issuer() string { return s.issuer }
 func (s *MCPOAuthServer) Resource() string { return s.issuer + "/mcp" }
 
 // ListGrants reads application authorizations for a current administrator owner.
-// This remains available when OAuth issuance is disabled so an administrator
-// can inspect and revoke previously established application connections.
+// This remains available when the frontend address is missing or invalid so
+// administrators can inspect and revoke previously established application connections.
 func (s *MCPOAuthServer) ListGrants(ctx context.Context, userID int64) ([]identity.MCPOAuthGrant, error) {
 	if err := s.administrator(ctx, userID); err != nil {
 		return nil, err
@@ -117,8 +117,8 @@ func (s *MCPOAuthServer) UpdateGrant(ctx context.Context, userID, id int64, inpu
 }
 
 // RevokeGrant permanently disables an application owned by the current administrator.
-// Existing access and refresh families are revoked together. Issuance can be
-// disabled while this owner-authorized management action remains available.
+// Existing access and refresh families are revoked together. An unavailable
+// frontend URL does not prevent this owner-authorized management action.
 func (s *MCPOAuthServer) RevokeGrant(ctx context.Context, userID, id int64) error {
 	if err := s.administrator(ctx, userID); err != nil {
 		return err

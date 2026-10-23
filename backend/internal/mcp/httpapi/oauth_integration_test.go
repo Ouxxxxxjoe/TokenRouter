@@ -44,7 +44,7 @@ type oauthFixture struct {
 	*mcpFixture                          // existing tool and browser fixtures
 	db          *sql.DB                  // migrated PostgreSQL database connection
 	oauth       *provider.MCPOAuthServer // initial protocol instance for fixture assertions
-	config      *oauthSettingsFixture    // Mutable single-server site settings.
+	config      *oauthFrontendFixture    // Mutable single-server site settings.
 	http        *httptest.Server         // canonical OAuth and MCP server
 	userID      int64                    // persisted administrator account identifier
 }
@@ -52,11 +52,11 @@ type oauthFixture struct {
 // oauthLimiterFixture isolates protocol persistence tests from Redis admission limits.
 type oauthLimiterFixture struct{}
 
-// oauthSettingsFixture holds the single test server's editable site configuration.
-type oauthSettingsFixture struct {
-	mu    sync.RWMutex                   // Protects HTTP and test configuration access.
-	value provider.MCPOAuthConfiguration // Current public address and switch.
-	err   error                          // Injected configuration read failure.
+// oauthFrontendFixture holds the single test server's editable site configuration.
+type oauthFrontendFixture struct {
+	mu  sync.RWMutex // Protects HTTP and test configuration access.
+	url string       // Current public frontend address.
+	err error        // Injected configuration read failure.
 }
 
 // newOAuthFixture mounts OAuth beside the existing production MCP handler.
@@ -73,7 +73,7 @@ func newOAuthFixture(t *testing.T) *oauthFixture {
 	server := httptest.NewUnstartedServer(router)
 	issuer := "http://" + server.Listener.Addr().String()
 	repo := postgres.NewMCPOAuthStore(db)
-	config := &oauthSettingsFixture{value: provider.MCPOAuthConfiguration{FrontendURL: issuer, Enabled: true}}
+	config := &oauthFrontendFixture{url: issuer}
 	oauth := provider.NewMCPOAuthServer(repo, base.accounts, config, bytes.Repeat([]byte{7}, 32))
 	base.handler.options.OAuth = oauth
 	base.handler.options.Limiter = &oauthLimiterFixture{}
@@ -524,26 +524,18 @@ func TestOAuthUploadUsesCurrentAuthorization(t *testing.T) {
 	require.NoError(t, response.Body.Close())
 }
 
-// Read copies site settings while excluding concurrent fixture updates.
-func (s *oauthSettingsFixture) Read(context.Context) (provider.MCPOAuthConfiguration, error) {
+// FrontendURL copies the site address while excluding concurrent fixture updates.
+func (s *oauthFrontendFixture) FrontendURL(context.Context) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.value, s.err
-}
-
-// SetEnabled updates the persisted-switch substitute for following HTTP requests.
-func (s *oauthSettingsFixture) SetEnabled(_ context.Context, enabled bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.value.Enabled = enabled
-	return nil
+	return s.url, s.err
 }
 
 // setFrontend replaces the fixture address before subsequent OAuth requests arrive.
-func (s *oauthSettingsFixture) setFrontend(value string) {
+func (s *oauthFrontendFixture) setFrontend(value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.value.FrontendURL = value
+	s.url = value
 }
 
 // TestOAuthFrontendRuntimeChanges uses the production protocol before and after site edits.
@@ -604,9 +596,9 @@ func TestOAuthFrontendRuntimeChanges(t *testing.T) {
 	require.Equal(t, grant.Permissions, renewedReview.Grant.Permissions)
 }
 
-// TestOAuthAvailabilityChangesWithoutRestart edits the address and switch after mounting routes.
-// Protocol discovery becomes available as soon as a valid site address exists;
-// browser-only switch updates disable subsequent credential and stable-grant checks.
+// TestOAuthAvailabilityChangesWithoutRestart edits the site address after mounting routes.
+// Protocol discovery becomes available as soon as a valid address exists;
+// missing addresses and read failures reject subsequent credential and grant checks.
 func TestOAuthAvailabilityChangesWithoutRestart(t *testing.T) {
 	f := newOAuthFixture(t)
 	f.config.setFrontend("")
@@ -620,7 +612,6 @@ func TestOAuthAvailabilityChangesWithoutRestart(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&state))
 	require.NoError(t, response.Body.Close())
-	require.True(t, state.Data.Allowed)
 	require.False(t, state.Data.Enabled)
 	require.Equal(t, "frontend_url_missing", state.Data.Reason)
 	f.config.setFrontend(f.http.URL)
@@ -632,24 +623,15 @@ func TestOAuthAvailabilityChangesWithoutRestart(t *testing.T) {
 	root := f.handler.options.OAuth
 	grant, err := root.Authenticate(t.Context(), access)
 	require.NoError(t, err)
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodPut, f.http.URL+"/api/v1/admin/mcp/oauth/status", strings.NewReader(`{"enabled":false}`))
-	require.NoError(t, err)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer browser")
-	response, err = http.DefaultClient.Do(request)
-	require.NoError(t, err)
-	require.NoError(t, json.NewDecoder(response.Body).Decode(&state))
+	response = f.browser(t, http.MethodPut, "/api/v1/admin/mcp/oauth/status", "browser")
 	require.NoError(t, response.Body.Close())
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	require.False(t, state.Data.Allowed)
-	require.Equal(t, "disabled", state.Data.Reason)
+	require.Equal(t, http.StatusNotFound, response.StatusCode)
+	f.config.setFrontend("")
 	_, err = root.Authenticate(t.Context(), access)
 	require.Error(t, err)
 	_, err = root.AuthorizeGrant(t.Context(), grant.ID)
 	require.Error(t, err)
-	response = f.browser(t, http.MethodPut, "/api/v1/admin/mcp/oauth/status", access)
-	require.NoError(t, response.Body.Close())
-	require.Equal(t, http.StatusUnauthorized, response.StatusCode)
+	f.config.setFrontend(f.http.URL)
 	f.config.mu.Lock()
 	f.config.err = errors.New("settings unavailable")
 	f.config.mu.Unlock()

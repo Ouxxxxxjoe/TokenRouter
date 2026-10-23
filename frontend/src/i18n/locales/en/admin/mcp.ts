@@ -27,8 +27,6 @@ export default {
       connectionTitle: 'Connect with OAuth',
       connectionHint:
         'Enter this MCP URL in your client and choose OAuth. Sign in to review and authorize its access.',
-      disabled: 'OAuth connections are disabled. Manual tokens remain available.',
-      allowConnections: 'Allow OAuth connections',
       frontendMissing: 'Set the frontend URL in system settings. OAuth uses that site address.',
       frontendInvalid:
         'The frontend URL must be a public HTTPS origin without a path, query or fragment. Loopback HTTP is supported for local development.',
@@ -128,7 +126,6 @@ export default {
     lastUsed: 'Last used',
     unused: 'Not used yet',
     active: 'Active',
-    disabled: 'Disabled',
     expired: 'Expired',
     revoked: 'Revoked',
     revoke: 'Revoke',

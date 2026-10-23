@@ -12,7 +12,6 @@ const api = vi.hoisted(() => ({
   listTokens: vi.fn(),
   listOAuthGrants: vi.fn(),
   getOAuthStatus: vi.fn(),
-  setOAuthEnabled: vi.fn(),
   updateOAuthGrant: vi.fn(),
   revokeOAuthGrant: vi.fn(),
   listOperations: vi.fn(),
@@ -569,46 +568,6 @@ it('opens OAuth consent over the application list and clears its URL on dismissa
   route.query = {}
 })
 
-// An administrator disables OAuth through the connection dialog. A rejected write
-// keeps the confirmed switch enabled, while a successful retry publishes disabled status.
-it('retains confirmed OAuth availability after failure and applies a successful switch', async () => {
-  route.name = 'AdminMCP'
-  route.query = {}
-  api.listTokens.mockResolvedValue([])
-  api.listOAuthGrants.mockResolvedValue([])
-  api.listOperations.mockResolvedValue(catalogue)
-  api.getOAuthStatus.mockResolvedValue({
-    enabled: true,
-    allowed: true,
-    reason: '',
-    issuer: 'https://site.example',
-    resource: 'https://site.example/mcp',
-  })
-  api.setOAuthEnabled.mockRejectedValueOnce(new Error('Settings could not be saved'))
-  const wrapper = page()
-  await flushPromises()
-  await wrapper.get('button[aria-label="admin.mcp.connection"]').trigger('click')
-  const toggle = wrapper.getComponent('[aria-label="admin.mcp.oauth.allowConnections"]')
-  toggle.vm.$emit('update:modelValue', false)
-  await flushPromises()
-  expect(api.setOAuthEnabled).toHaveBeenCalledWith(false)
-  expect(toggle.attributes('modelvalue')).toBe('true')
-  expect(wrapper.text()).toContain('Settings could not be saved')
-  api.setOAuthEnabled.mockResolvedValueOnce({
-    enabled: false,
-    allowed: false,
-    reason: 'disabled',
-    issuer: 'https://site.example',
-    resource: 'https://site.example/mcp',
-  })
-  toggle.vm.$emit('update:modelValue', false)
-  await flushPromises()
-  expect(toggle.attributes('modelvalue')).toBe('false')
-  expect(wrapper.text()).toContain('admin.mcp.oauth.disabled')
-  expect(wrapper.text()).toContain('https://site.example/mcp')
-  wrapper.unmount()
-})
-
 // An existing deployment has no frontend URL when opening connection guidance.
 // The page explains the missing site setting and links to its existing security tab.
 it('guides an unconfigured OAuth deployment to the existing frontend setting', async () => {
@@ -619,7 +578,6 @@ it('guides an unconfigured OAuth deployment to the existing frontend setting', a
   api.listOperations.mockResolvedValue(catalogue)
   api.getOAuthStatus.mockResolvedValue({
     enabled: false,
-    allowed: true,
     reason: 'frontend_url_missing',
     issuer: '',
     resource: '',
@@ -644,7 +602,6 @@ it('marks applications authorized for the previous site address as needing recon
   api.listOperations.mockResolvedValue(catalogue)
   api.getOAuthStatus.mockResolvedValue({
     enabled: true,
-    allowed: true,
     reason: '',
     issuer: 'https://new.example',
     resource: 'https://new.example/mcp',
