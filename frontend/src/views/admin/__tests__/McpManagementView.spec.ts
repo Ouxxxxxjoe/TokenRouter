@@ -25,12 +25,14 @@ const api = vi.hoisted(() => ({
 }))
 vi.mock('@/api/admin/mcp', () => api)
 // Route fixtures select incoming confirmation or file workflows before mounting the page.
-const route = vi.hoisted(() => ({ query: {} as Record<string, string> }))
+const route = vi.hoisted(() => ({ name: 'AdminMCP', query: {} as Record<string, string> }))
+const routerReplace = vi.hoisted(() => vi.fn())
 const saveAs = vi.hoisted(() => vi.fn())
 vi.mock('file-saver', () => ({ saveAs }))
 vi.mock('vue-router', async (importOriginal) => ({
   ...(await importOriginal<typeof import('vue-router')>()),
   useRoute: () => route,
+  useRouter: () => ({ replace: routerReplace }),
   RouterLink: { name: 'RouterLink', props: ['to'], template: '<a><slot /></a>' },
 }))
 vi.mock('vue-i18n', async (importOriginal) => ({
@@ -108,9 +110,15 @@ function page() {
             '<section v-if="show"><h2>{{ title }}</h2><slot/><slot name="footer"/></section>',
         },
         Teleport: true,
-        MotionTransition: { template: '<slot />' },
+        MotionTransition: { props: ['name'], template: '<slot />' },
         ConfirmDialog: true,
         TotpStepUpDialog: true,
+        McpAuthorizeDialog: {
+          name: 'McpAuthorizeDialog',
+          props: ['show', 'requestId'],
+          emits: ['close', 'after-leave'],
+          template: '<div v-if="show" data-test="authorization-dialog">{{ requestId }}</div>',
+        },
         Icon: true,
         DateTimePicker: true,
         Select: true,
@@ -132,6 +140,8 @@ describe('MCP token management', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     route.query = {}
+    route.name = 'AdminMCP'
+    routerReplace.mockResolvedValue(undefined)
     copyToClipboard.mockResolvedValue(true)
     api.listTokens.mockResolvedValue([])
     api.listOAuthGrants.mockResolvedValue([])
@@ -517,7 +527,8 @@ it('edits an application through its independent authorization endpoint', async 
   api.updateOAuthGrant.mockResolvedValue(grant)
   const wrapper = page()
   await flushPromises()
-  await clickText(wrapper, 'admin.mcp.oauth.applications')
+  await wrapper.get('[data-test="scope-dropdown-trigger"]').trigger('click')
+  await wrapper.get('[data-test="scope-option-applications"]').trigger('click')
   await clickText(wrapper, 'common.edit')
   await wrapper.get('input[required]').setValue('My application')
   await wrapper.get('form').trigger('submit')
@@ -527,4 +538,32 @@ it('edits an application through its independent authorization endpoint', async 
     expect.objectContaining({ name: 'My application', expected_updated_at: grant.updated_at }),
   )
   wrapper.unmount()
+})
+
+// The authorization URL reuses management and opens a modal over applications.
+// Closing removes the request from navigation while retaining unrelated query state.
+it('opens OAuth consent over the application list and clears its URL on dismissal', async () => {
+  route.name = 'AdminMCPAuthorize'
+  route.query = { request: 'review-request', retained: 'yes' }
+  api.listTokens.mockResolvedValue([])
+  api.listOAuthGrants.mockResolvedValue([])
+  api.listOperations.mockResolvedValue(catalogue)
+  api.getOAuthStatus.mockResolvedValue({
+    enabled: true,
+    issuer: 'https://gateway.example',
+    resource: 'https://gateway.example/mcp',
+  })
+  routerReplace.mockResolvedValue(undefined)
+  const wrapper = page()
+  await flushPromises()
+  expect(wrapper.get('[data-test="scope-dropdown-trigger"]').text()).toContain(
+    'admin.mcp.oauth.applications',
+  )
+  expect(wrapper.get('[data-test="authorization-dialog"]').text()).toBe('review-request')
+  wrapper.findComponent({ name: 'McpAuthorizeDialog' }).vm.$emit('close')
+  await flushPromises()
+  expect(routerReplace).toHaveBeenCalledWith({ name: 'AdminMCP', query: { retained: 'yes' } })
+  wrapper.unmount()
+  route.name = 'AdminMCP'
+  route.query = {}
 })

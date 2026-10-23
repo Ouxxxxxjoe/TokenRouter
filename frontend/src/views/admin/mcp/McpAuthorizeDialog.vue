@@ -1,9 +1,13 @@
 <template>
-  <AppLayout>
-    <section
-      class="mx-auto w-full max-w-3xl space-y-6 p-4 sm:p-6"
-      :aria-busy="loading || submitting"
-    >
+  <BaseDialog
+    :show="show"
+    :title="t('admin.mcp.oauth.authorizeTitle')"
+    width="normal"
+    :close-on-escape="!submitting"
+    @close="close"
+    @after-leave="emit('after-leave')"
+  >
+    <div class="space-y-5" :aria-busy="loading || submitting">
       <p v-if="loading" class="text-sm text-gray-500" role="status">{{ t('common.loading') }}</p>
       <p
         v-if="error"
@@ -12,9 +16,7 @@
         >{{ error }}</p
       >
       <template v-if="review && !loading">
-        <dl
-          class="grid gap-4 rounded-surface border border-gray-200 p-4 dark:border-dark-700 sm:grid-cols-2"
-        >
+        <dl class="grid gap-4 sm:grid-cols-2">
           <div
             ><dt class="text-sm text-gray-500 dark:text-gray-400">{{
               t('admin.mcp.oauth.account')
@@ -67,24 +69,6 @@
         <p v-if="expired" role="alert" class="text-sm text-amber-700 dark:text-amber-400">{{
           t('admin.mcp.oauth.expired')
         }}</p>
-        <div
-          class="flex flex-wrap justify-end gap-3 border-t border-gray-200 pt-4 dark:border-dark-700"
-        >
-          <button
-            class="btn btn-secondary"
-            type="button"
-            :disabled="submitting || expired"
-            @click="decide(false)"
-            >{{ t('admin.mcp.oauth.deny') }}</button
-          >
-          <button
-            class="btn btn-primary"
-            type="button"
-            :disabled="submitting || expired || !selected.size"
-            @click="decide(true)"
-            >{{ submitting ? t('common.processing') : t('admin.mcp.oauth.authorize') }}</button
-          >
-        </div>
       </template>
       <button
         v-if="error && !review"
@@ -94,37 +78,61 @@
         @click="load"
         >{{ t('admin.mcp.refresh') }}</button
       >
-    </section>
-    <TotpStepUpDialog :controller="stepUp" />
-  </AppLayout>
+    </div>
+    <template v-if="review && !loading" #footer>
+      <div class="flex justify-end gap-2">
+        <button
+          class="btn btn-secondary"
+          type="button"
+          :disabled="submitting || expired"
+          @click="decide(false)"
+          >{{ t('admin.mcp.oauth.deny') }}</button
+        >
+        <button
+          class="btn btn-primary"
+          type="button"
+          :disabled="submitting || expired || !selected.size"
+          @click="decide(true)"
+          >{{ submitting ? t('common.processing') : t('admin.mcp.oauth.authorize') }}</button
+        >
+      </div>
+    </template>
+  </BaseDialog>
+  <TotpStepUpDialog :controller="stepUp" />
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import AppLayout from '@/components/layout/AppLayout.vue'
+import BaseDialog from '@/components/common/BaseDialog.vue'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
 import { useStepUp, isStepUpCancelled } from '@/composables/useStepUp'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime } from '@/utils/format'
 import * as api from '@/api/admin/mcp'
-import McpPermissionPicker from './mcp/McpPermissionPicker.vue'
-import { permissionPresets } from './mcp/permissions'
+import McpPermissionPicker from './McpPermissionPicker.vue'
+import { permissionPresets } from './permissions'
 
-// McpAuthorizeView.vue presents one session-bound application authorization request.
+// McpAuthorizeDialog.vue presents a session-bound application request over MCP management.
 // The server supplies client identity, callback, and the current operation
 // catalogue; the administrator chooses exact permissions and approves or denies.
 // First connections start with safe reads, while returning applications show
 // their existing permission selection for deliberate review before replacement.
 //
-// Route or account changes cancel pending reads and discard the previous nonce.
+// Closing the dialog or changing its request or account cancels pending reads.
 // A decision response can navigate only while its request and administrator are
 // still current. Failed submissions retain the selected permissions, and local
 // expiry disables submission until the client starts a new authorization flow.
 
-// Browser identity and shared verification UI belong to this mounted consent page.
-const route = useRoute()
+// Browser identity and shared verification UI belong to this mounted consent dialog.
+const props = defineProps<{
+  show: boolean // Parent-owned dialog visibility.
+  requestId: string // Incoming OAuth request identifier.
+}>()
+const emit = defineEmits<{
+  (event: 'close'): void // Requests local workflow dismissal.
+  (event: 'after-leave'): void // Reports completed dialog exit.
+}>()
 const { t } = useI18n()
 const auth = useAuthStore()
 const stepUp = useStepUp()
@@ -157,15 +165,23 @@ function messageOf(value: unknown): string {
 }
 
 // load binds the current request and publishes only its latest authenticated review.
-// A changed route or account aborts the preceding read and clears its approval
-// proof. Each successful load initializes permissions from existing consent or safe reads.
+// A changed request or account aborts the preceding read and clears its approval
+// proof. Each successful load initializes permissions from existing consent or safe
+// reads, intersected with the current catalogue. The request's controller decides
+// which result can update the dialog; an older request cannot replace a newer
+// review or end its loading indicator. Missing identifiers leave a dismissible
+// error without contacting the authorization API.
 async function load() {
+  // Replacing a review invalidates both its pending read and any verification
+  // prompt, so their results cannot resume a decision for the replaced account.
   controller?.abort()
+  stepUp.onCancel()
   const current = new AbortController()
   controller = current
   review.value = null
   error.value = ''
-  const id = route.query.request
+  loading.value = false
+  const id = props.requestId
   if (typeof id !== 'string' || !id) {
     error.value = t('admin.mcp.oauth.expired')
     return
@@ -194,6 +210,10 @@ async function load() {
 // decide submits the current permission choice and navigates after a committed decision.
 // TOTP verification retries the same session-bound request. Failures retain the
 // draft, and account changes prevent an old callback from navigating the new session.
+// The administrator and review are captured before submission, then checked again
+// after verification and the API call. The returned URL must match the reviewed
+// callback origin and path before navigation; a changed dialog or request leaves
+// the response unused. Concurrent submissions are ignored until the pending one ends.
 async function decide(approve: boolean) {
   const current = review.value
   const userID = auth.user?.id
@@ -205,7 +225,16 @@ async function decide(approve: boolean) {
     const target = await stepUp.run(() =>
       api.decideOAuthRequest(current.request.id, current.nonce, approve, permissions),
     )
-    if (disposed || review.value !== current || auth.user?.id !== userID) return
+    // A completed decision belongs to the original administrator and request;
+    // leaving this workflow must prevent its callback from replacing the current page.
+    if (
+      disposed ||
+      !props.show ||
+      props.requestId !== current.request.id ||
+      review.value !== current ||
+      auth.user?.id !== userID
+    )
+      return
     const expected = new URL(current.redirect_uri)
     const callback = new URL(target)
     if (
@@ -216,15 +245,46 @@ async function decide(approve: boolean) {
       throw new Error(t('admin.mcp.oauth.callbackInvalid'))
     window.location.assign(callback.href)
   } catch (cause) {
-    if (!disposed && !isStepUpCancelled(cause)) error.value = messageOf(cause)
+    if (
+      !disposed &&
+      props.show &&
+      review.value === current &&
+      auth.user?.id === userID &&
+      !isStepUpCancelled(cause)
+    )
+      error.value = messageOf(cause)
   } finally {
     submitting.value = false
   }
 }
 
-// Account changes discard the previous request proof before another consent decision is possible.
-watch(() => [route.query.request, auth.user?.id], load, { immediate: true })
-// Disposal cancels pending reads and verification, then releases the local expiry timer.
+// close rejects a usable request before returning to its validated client callback.
+// An expired request or failed workflow can be dismissed locally. In-flight
+// decisions keep the dialog open until their result can be presented safely.
+function close() {
+  if (submitting.value) return
+  if (review.value && !expired.value && !error.value) {
+    void decide(false)
+    return
+  }
+  emit('close')
+}
+
+// Watch scalar identities so ordinary profile refreshes cannot reset the draft.
+// Closing retains rendered content for the shell's exit and cancels pending reads.
+watch(
+  [() => props.show, () => props.requestId, () => auth.user?.id],
+  ([show]) => {
+    if (show) void load()
+    else {
+      controller?.abort()
+      stepUp.onCancel()
+    }
+  },
+  { immediate: true },
+)
+// Disposal cancels pending reads and verification, then releases the local expiry
+// timer so an unmounted dialog cannot keep updating its review state.
 onBeforeUnmount(() => {
   disposed = true
   controller?.abort()

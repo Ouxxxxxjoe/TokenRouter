@@ -70,20 +70,8 @@
       </template>
       <template #filters>
         <div class="flex flex-col gap-2">
-          <div class="tabs self-start" role="group" :aria-label="t('admin.mcp.title')">
-            <button
-              v-for="tab in ['tokens', 'applications']"
-              :key="tab"
-              type="button"
-              class="tab"
-              :class="{ 'tab-active': activeTab === tab }"
-              :aria-pressed="activeTab === tab"
-              @click="activeTab = tab"
-              >{{ t(`admin.mcp.oauth.${tab}`) }}</button
-            >
-          </div>
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="input-icon-wrap w-full sm:w-72">
+          <div class="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+            <div class="input-icon-wrap min-w-0 w-full sm:w-72">
               <Icon name="search" size="md" class="input-icon text-gray-400" />
               <input
                 v-model="search"
@@ -96,7 +84,7 @@
                 "
               />
             </div>
-            <div class="ml-auto flex gap-2">
+            <div class="flex shrink-0 justify-end gap-2">
               <button
                 class="btn btn-secondary btn-icon"
                 type="button"
@@ -106,9 +94,22 @@
                 @click="load"
                 ><Icon name="refresh" size="sm" :class="loading ? 'animate-spin' : ''"
               /></button>
-              <button class="btn btn-secondary" type="button" @click="connectionOpen = true">
-                <Icon name="link" size="sm" class="mr-2" />{{ t('admin.mcp.connection') }}
+              <button
+                class="btn btn-secondary btn-icon whitespace-nowrap sm:w-auto sm:px-3 sm:py-1.5"
+                type="button"
+                :title="t('admin.mcp.connection')"
+                :aria-label="t('admin.mcp.connection')"
+                @click="connectionOpen = true"
+              >
+                <Icon name="link" size="sm" /><span class="hidden sm:inline">{{
+                  t('admin.mcp.connection')
+                }}</span>
               </button>
+              <ScopeSelector
+                v-model="activeTab"
+                :options="sourceOptions"
+                :label="t('admin.mcp.oauth.switchSource')"
+              />
               <button
                 v-if="activeTab === 'tokens'"
                 class="btn btn-primary"
@@ -488,13 +489,20 @@
       @confirm="revoke"
       @cancel="revoking = null"
     />
+    <McpAuthorizeDialog
+      v-if="authorizationPresent"
+      :show="authorizationOpen"
+      :request-id="authorizationRequestID"
+      @close="closeAuthorization"
+      @after-leave="authorizationAfterLeave"
+    />
     <TotpStepUpDialog :controller="stepUp" />
   </AppLayout>
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
-import { RouterLink, useRoute } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { saveAs } from 'file-saver'
 import AppLayout from '@/components/layout/AppLayout.vue'
@@ -503,6 +511,9 @@ import DataTable from '@/components/common/table/DataTable.vue'
 import type { Column } from '@/components/common/table/types'
 import MotionTransition from '@/components/common/MotionTransition.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
+import ScopeSelector from '@/components/common/ScopeSelector.vue'
+import McpAuthorizeDialog from './mcp/McpAuthorizeDialog.vue'
+import { useLeavingPresence } from '@/composables/useLeavingPresence'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import DateTimePicker from '@/components/common/DateTimePicker.vue'
 import McpPermissionPicker from './mcp/McpPermissionPicker.vue'
@@ -521,9 +532,10 @@ import { formatDateTime } from '@/utils/format'
 import type { MCPToken, MCPTokenInput, MCPOperation, MCPConfirmation } from '@/api/admin/mcp'
 
 // McpManagementView.vue manages administrator-owned agent credentials and reviews
-// incoming confirmation links. Permission choices come from the backend operation
-// catalogue, while token creation keeps the returned secret only in this mounted
-// view. Closing the delivery dialog or leaving the page clears that value.
+// incoming confirmations and OAuth authorization requests. Permission choices come
+// from the backend operation catalogue, while token creation keeps the returned
+// secret only in this mounted view. Closing the delivery dialog or leaving the
+// page clears that value.
 //
 // Reloads cancel their preceding request group before publishing token and
 // operation snapshots. Mutation failures keep the editor draft intact; successful
@@ -535,6 +547,7 @@ import type { MCPToken, MCPTokenInput, MCPOperation, MCPConfirmation } from '@/a
 // Shared UI services supply locale, browser-route state, feedback, and strong authentication.
 const { t, locale } = useI18n()
 const route = useRoute()
+const router = useRouter()
 const app = useAppStore()
 const stepUp = useStepUp()
 const { copyToClipboard } = useClipboard()
@@ -543,6 +556,25 @@ const { copyToClipboard } = useClipboard()
 const tokens = ref<MCPToken[]>([])
 const applications = ref<MCPToken[]>([])
 const activeTab = ref('tokens')
+const sourceOptions = computed(() => [
+  { value: 'tokens', label: t('admin.mcp.oauth.tokens'), icon: 'key' as const },
+  { value: 'applications', label: t('admin.mcp.oauth.applications'), icon: 'grid' as const },
+])
+// The OAuth URL opens consent over the application list and survives login redirects.
+const authorizationOpen = computed(() => route.name === 'AdminMCPAuthorize')
+const authorizationRequestID = computed(() =>
+  typeof route.query.request === 'string' ? route.query.request : '',
+)
+const { present: authorizationPresent, afterLeave: authorizationAfterLeave } = useLeavingPresence(
+  () => authorizationOpen.value,
+)
+watch(
+  authorizationOpen,
+  (open) => {
+    if (open) activeTab.value = 'applications'
+  },
+  { immediate: true },
+)
 const oauthStatus = ref<api.MCPOAuthStatus | null>(null)
 const editingSource = ref('')
 const operations = ref<MCPOperation[]>([])
@@ -953,6 +985,15 @@ function connectionText(secret = '<MCP_ACCESS_TOKEN>'): string {
 // clearCredential removes the only complete credential retained by this mounted page.
 function clearCredential() {
   credential.value = ''
+}
+
+// closeAuthorization returns an expired or dismissed workflow to MCP management.
+// The request identifier leaves the URL after dismissal; unrelated query values
+// remain available and the existing list instance retains its selected scope.
+async function closeAuthorization() {
+  const query = { ...route.query }
+  delete query.request
+  await router.replace({ name: 'AdminMCP', query })
 }
 
 // A changed incoming workflow cancels stale reads before publishing its review state.

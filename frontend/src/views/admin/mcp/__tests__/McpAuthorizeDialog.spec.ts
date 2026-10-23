@@ -1,16 +1,14 @@
 import { mount, flushPromises } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import McpAuthorizeView from '../McpAuthorizeView.vue'
+import McpAuthorizeDialog from '../McpAuthorizeDialog.vue'
 
-// McpAuthorizeView.spec.ts exercises consent defaults, explicit submission, and
+// McpAuthorizeDialog.spec.ts exercises consent defaults, explicit submission, and
 // failed-decision recovery. Browser navigation is avoided by failed API fixtures;
 // the real component still retains its session-bound request and selected grants.
 
 // API and authenticated-route fixtures represent one administrator reviewing one request.
 const api = vi.hoisted(() => ({ getOAuthReview: vi.fn(), decideOAuthRequest: vi.fn() }))
-const route = vi.hoisted(() => ({ query: { request: 'request-one' } }))
 vi.mock('@/api/admin/mcp', () => api)
-vi.mock('vue-router', () => ({ useRoute: () => route }))
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({ user: { id: 1, email: 'admin@example.invalid' } }),
 }))
@@ -60,12 +58,18 @@ function review() {
   }
 }
 
-// page mounts consent and replaces only unrelated layout and step-up dialog rendering.
+// page mounts consent inside a dialog shell with visible body and footer slots.
 function page() {
-  return mount(McpAuthorizeView, {
+  return mount(McpAuthorizeDialog, {
+    props: { show: true, requestId: 'request-one' },
     global: {
       stubs: {
-        AppLayout: { template: '<main><slot /></main>' },
+        BaseDialog: {
+          props: ['show', 'title'],
+          emits: ['close', 'after-leave'],
+          template:
+            '<section v-if="show" role="dialog"><h2>{{ title }}</h2><button data-test="dismiss" @click="$emit(\'close\')">Close</button><slot/><footer><slot name="footer"/></footer></section>',
+        },
         TotpStepUpDialog: true,
         Icon: true,
         Select: true,
@@ -136,6 +140,59 @@ describe('MCP application consent', () => {
         .attributes('disabled'),
     ).toBeDefined()
     expect(api.decideOAuthRequest).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  // Closing a usable request expresses denial through the authenticated OAuth API.
+  // A failed denial leaves its error visible so a subsequent close can dismiss locally.
+  it('rejects the active request when the dialog is closed', async () => {
+    api.decideOAuthRequest.mockRejectedValue(new Error('Unable to return to the client'))
+    const wrapper = page()
+    await flushPromises()
+    await wrapper.get('[data-test="dismiss"]').trigger('click')
+    await flushPromises()
+    expect(api.decideOAuthRequest).toHaveBeenCalledWith('request-one', 'browser-nonce', false, [
+      'groups.list',
+    ])
+    expect(wrapper.emitted('close')).toBeUndefined()
+    await wrapper.get('[data-test="dismiss"]').trigger('click')
+    expect(wrapper.emitted('close')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  // A failed review has no validated callback or approval proof. Dismissal returns
+  // to management without submitting an authorization decision for unavailable state.
+  it('dismisses an unavailable request without posting a decision', async () => {
+    api.getOAuthReview.mockRejectedValue(new Error('Request expired'))
+    const wrapper = page()
+    await flushPromises()
+    await wrapper.get('[data-test="dismiss"]').trigger('click')
+    expect(wrapper.emitted('close')).toHaveLength(1)
+    expect(api.decideOAuthRequest).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  // An approval already in flight must finish before the user can dismiss the
+  // dialog. A close during submission cannot send an additional conflicting denial.
+  it('keeps the dialog open while its decision is being submitted', async () => {
+    let rejectDecision: (error: Error) => void = () => undefined
+    api.decideOAuthRequest.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectDecision = reject
+        }),
+    )
+    const wrapper = page()
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'admin.mcp.oauth.authorize')!
+      .trigger('click')
+    await wrapper.get('[data-test="dismiss"]').trigger('click')
+    expect(api.decideOAuthRequest).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('close')).toBeUndefined()
+    rejectDecision(new Error('Request interrupted'))
+    await flushPromises()
     wrapper.unmount()
   })
 })

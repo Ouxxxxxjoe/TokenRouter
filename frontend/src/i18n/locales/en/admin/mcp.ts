@@ -5,6 +5,7 @@
 export default {
   mcp: {
     oauth: {
+      switchSource: 'Switch access type',
       requestExpires: 'Request expires',
       authorizationExpires: 'Authorization expires',
       search: 'Search applications',
@@ -29,8 +30,6 @@ export default {
       disabled:
         'OAuth is disabled. Set MCP_OAUTH_ISSUER_URL to the public HTTPS origin of this server.',
       authorizeTitle: 'Authorize an application',
-      authorizeHint:
-        'Review the application and choose which management operations it can perform.',
       identityHint:
         'Check the client identifier and return address. An application name alone does not verify who operates it.',
       lifetimeHint:

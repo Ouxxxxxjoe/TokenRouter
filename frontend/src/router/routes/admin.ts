@@ -9,12 +9,13 @@ export const adminRoutes: RouteRecordRaw[] = [
   {
     path: '/admin/mcp/authorize',
     name: 'AdminMCPAuthorize',
-    component: () => import('@/views/admin/McpAuthorizeView.vue'),
+    component: () => import('@/views/admin/McpManagementView.vue'),
     meta: {
       requiresAuth: true,
       requiresAdmin: true,
-      title: 'Authorize application',
-      titleKey: 'admin.mcp.oauth.authorizeTitle',
+      title: 'MCP management',
+      titleKey: 'admin.mcp.title',
+      descriptionKey: 'admin.mcp.description',
     },
   },
   {

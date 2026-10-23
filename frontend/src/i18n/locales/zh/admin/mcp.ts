@@ -5,6 +5,7 @@
 export default {
   mcp: {
     oauth: {
+      switchSource: '切换接入方式',
       requestExpires: '请求截止时间',
       authorizationExpires: '授权有效期',
       search: '搜索应用',
@@ -26,7 +27,6 @@ export default {
       connectionHint: '在客户端填写此 MCP 地址并选择 OAuth，登录后确认应用及其访问权限。',
       disabled: 'OAuth 尚未启用。将 MCP_OAUTH_ISSUER_URL 配置为服务器的公开 HTTPS 地址后即可启用。',
       authorizeTitle: '授权应用访问',
-      authorizeHint: '核对应用信息，选择允许它执行的管理操作。',
       identityHint: '请核对客户端标识和返回地址。应用名称由客户端提供，不能单凭名称确认其运营者。',
       lifetimeHint: '授权持续有效，直到你主动撤销。连续 30 天未刷新连接后，客户端需要重新连接。',
       expired: '此授权请求已过期，请返回客户端重新连接。',

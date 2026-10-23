@@ -243,7 +243,7 @@ function operationLabel(operation: MCPOperation): string {
   return locale.value.startsWith('zh') && operation.title_zh ? operation.title_zh : operation.title
 }
 
-// Initial disclosure reflects the supplied draft, including a consent page's safe-read default.
+// Initial disclosure reflects the supplied draft, including a consent dialog's safe-read default.
 watch(
   () => props.operations,
   () => {

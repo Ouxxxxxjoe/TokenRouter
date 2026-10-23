@@ -66,7 +66,7 @@ JSON 响应提供共享 HTTP envelope schema；已声明的具体响应 DTO 会�
 
 授权服务器公布 RFC 9207 issuer 支持，并在已验证的成功或错误回调中返回 `iss`。授权和授权码换票需要匹配 resource；刷新请求省略 resource 时继承凭据族已绑定的 resource，提交不同值则拒绝。`mcp` scope 表示接入资格，实际可调用操作由持久授权中的具体 ID 决定。`offline_access` 由授权服务器公布，资源发现不将它作为必需权限。支持 refresh_token 的客户端获得可轮换的刷新凭据。
 
-管理员在 `/admin/mcp/authorize` 登录并决定授权。十分钟请求绑定当前管理员及 JWT session，决定提交还需 session-bound nonce。首次默认勾选安全只读预设；已有应用展示当前权限，新增操作不会自动加入。批准使用现有近期 TOTP 策略，拒绝不要求 step-up。确认请求只能消费一次，客户端不能替用户批准。
+管理员通过 `/admin/mcp/authorize` 登录后，在 MCP 管理页的授权弹窗中决定授权。有效请求关闭时提交拒绝，过期或失败的流程可关闭并返回管理列表。十分钟请求绑定当前管理员及 JWT session，决定提交还需 session-bound nonce。首次默认勾选安全只读预设；已有应用展示当前权限，新增操作不会自动加入。批准使用现有近期 TOTP 策略，拒绝不要求 step-up。确认请求只能消费一次，客户端不能替用户批准。
 
 授权码有效期五分钟，access token 有效期十五分钟，refresh token 每次使用后轮换并续期三十天。应用授权默认无固定期限，连续三十天未刷新需要重新连接。授权与 token 原文分开存储，OAuth token 不提供浏览器复制功能。重用已消费的 refresh token 会撤销其整个凭据族；其他应用和手工令牌不受该次撤销影响。
 
