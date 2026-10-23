@@ -14,20 +14,18 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/pkg/apperror"
 )
 
-// mcp_tokens.go issues administrator-owned MCP credentials and revalidates
-// their current grants before use. Credentials contain random bytes and are
-// authenticated by their digests and encrypted for administrator copy actions.
-// Ordinary metadata reads and authentication do not load or decrypt ciphertext.
-// Every authorization reads both the token and the current owning user, so
-// revocation, expiry, disabling, and administrator demotion affect subsequent
-// calls without an authorization-cache invalidation protocol.
+// mcp_tokens.go issues manual MCP credentials and resolves current administrator
+// permissions for manual tokens and OAuth application grants. Manual credentials
+// use random bytes, stored verification digests, and encrypted values for browser
+// copy actions. OAuth credential verification is delegated to the configured
+// resolver, which returns the same permission representation with its source.
 //
-// Confirmation preferences travel with the stored permission set. They control
-// whether the MCP executor asks for browser review, while the original route
-// retains its own strong-authentication checks. Configuration timestamps identify
-// those settings for approved and direct sensitive dispatches; recording recent
-// usage leaves that version unchanged. Catalogue validation stays with the HTTP
-// owner because identity persistence does not define administrative operations.
+// Every authorization reads the current owner and grant, so revocation, expiry,
+// disabling, and administrator demotion affect subsequent calls. Confirmation
+// preferences and configuration timestamps accompany both sources; usage writes
+// leave that configuration version unchanged. Browser and internal dispatch
+// callers pass source-qualified identifiers so equal numeric IDs cannot select
+// a grant from a different credential store.
 
 var (
 	// MCP token errors distinguish invalid input from credentials that cannot
@@ -36,8 +34,15 @@ var (
 	ErrMCPTokenNotFound = apperror.NotFound("MCP_TOKEN_NOT_FOUND", "MCP access token not found")
 )
 
-// MCPToken is the public metadata and persisted grants of an administrator credential.
+// MCPToken contains the permissions and metadata of a manual token or OAuth grant.
 type MCPToken struct {
+	// Source distinguishes OAuth grants from manual credentials; an empty value
+	// retains the identity of manual tokens and existing serialized temporary records.
+	Source string `json:"source,omitempty"` // OAuth or empty manual source
+	// Credential accompanies the current internal OAuth dispatch and is excluded
+	// from metadata, stored approval records, and every browser response.
+	Credential string `json:"-"` // request-local opaque OAuth credential
+
 	ID          int64    `json:"id"`          // persisted token identifier
 	UserID      int64    `json:"user_id"`     // owning administrator identifier
 	Name        string   `json:"name"`        // administrator chosen label
@@ -105,6 +110,7 @@ type MCPTokenService struct {
 	// cipher is absent when deployment encryption is ephemeral; issuance and
 	// plaintext recovery then fail before producing a credential that cannot survive restart.
 	cipher SecretEncryptor
+	oauth  MCPOAuthResolver // optional OAuth credential resolver
 }
 
 // NewMCPTokenService binds grants, current accounts, and durable secret encryption.
@@ -194,6 +200,14 @@ func (s *MCPTokenService) Credential(ctx context.Context, userID, id int64) (*MC
 //
 // @project-doc docs/interfaces/mcp_management.md#access_tokens
 func (s *MCPTokenService) Authenticate(ctx context.Context, credential string) (*MCPToken, *User, error) {
+	if !strings.HasPrefix(credential, "tr_mcp_") && s.oauth != nil {
+		token, err := s.oauth.Authenticate(ctx, credential)
+		if err != nil {
+			return nil, nil, ErrMCPTokenInvalid
+		}
+		token.Credential = credential
+		return s.authorize(ctx, token)
+	}
 	if !strings.HasPrefix(credential, "tr_mcp_") || len(credential) != 50 {
 		return nil, nil, ErrMCPTokenInvalid
 	}
@@ -228,7 +242,9 @@ func (s *MCPTokenService) authorize(ctx context.Context, token *MCPToken) (*MCPT
 	}
 	// Last-use recording does not decide admission; keeping it best-effort avoids
 	// rejecting an otherwise valid credential solely because its observation write failed.
-	_ = s.repo.Touch(ctx, token.ID)
+	if token.Source == "" {
+		_ = s.repo.Touch(ctx, token.ID)
+	}
 	return token, user, nil
 }
 
@@ -279,3 +295,35 @@ func validateMCPTokenInput(input MCPTokenInput) error {
 	}
 	return nil
 }
+
+// SetOAuth attaches the immutable OAuth resolver before HTTP routes begin serving.
+// Application assembly calls this once; requests never replace the resolver while
+// authentication or internal administrative dispatch is in progress.
+func (s *MCPTokenService) SetOAuth(resolver MCPOAuthResolver) { s.oauth = resolver }
+
+// AuthorizeReference rechecks a stable grant and, when present, its access credential.
+// Browser confirmations use the stable reference after their owner's JWT check.
+// Tool dispatches also provide the current credential to observe family revocation.
+func (s *MCPTokenService) AuthorizeReference(ctx context.Context, source string, id int64, credential string) (*MCPToken, *User, error) {
+	if source == "" {
+		return s.AuthorizeID(ctx, id)
+	}
+	if source != "oauth" || s.oauth == nil {
+		return nil, nil, ErrMCPTokenInvalid
+	}
+	var token *MCPToken
+	var err error
+	if credential != "" {
+		token, err = s.oauth.Authenticate(ctx, credential)
+	} else {
+		token, err = s.oauth.AuthorizeGrant(ctx, id)
+	}
+	if err != nil || token.ID != id {
+		return nil, nil, ErrMCPTokenInvalid
+	}
+	token.Credential = credential
+	return s.authorize(ctx, token)
+}
+
+// ValidateMCPGrantInput checks browser-managed grant settings before repository persistence.
+func ValidateMCPGrantInput(input MCPTokenInput) error { return validateMCPTokenInput(input) }

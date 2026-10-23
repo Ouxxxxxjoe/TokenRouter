@@ -91,6 +91,7 @@ services:
       # JWT Configuration
       # =======================================================================
       - JWT_SECRET=${JWT_SECRET:-}
+      - MCP_OAUTH_ISSUER_URL=${MCP_OAUTH_ISSUER_URL:-}
       - JWT_EXPIRE_HOUR=${JWT_EXPIRE_HOUR:-24}
 
       # =======================================================================

@@ -66,7 +66,7 @@ func (h *Handler) call(ctx context.Context, req *mcp.CallToolRequest, readOnly b
 			return toolFailure(errors.New("supply body or file_id, not both"))
 		}
 		file, err := h.state.GetArtifact(ctx, input.FileID)
-		if err != nil || file.TokenID != token.ID || file.UserID != token.UserID || file.OperationID != op.ID || file.Download != nil {
+		if err != nil || file.Source != token.Source || file.TokenID != token.ID || file.UserID != token.UserID || file.OperationID != op.ID || file.Download != nil {
 			return toolFailure(errors.New("uploaded file is unavailable for this token and operation"))
 		}
 		input.Body = json.RawMessage(file.Data)
@@ -237,14 +237,14 @@ func (h *Handler) confirmation(ctx context.Context, token *identity.MCPToken, op
 			preview = formatted.String()
 		}
 		now := time.Now().UTC()
-		approval := &control.Approval{ID: uuid.NewString(), UserID: token.UserID, TokenID: token.ID, OperationID: op.ID, TokenVersion: version, Digest: digest, Preview: preview, StepUp: op.RequiresStepUp(arguments), State: "pending", CreatedAt: now, ExpiresAt: now.Add(confirmationTTL)}
+		approval := &control.Approval{ID: uuid.NewString(), UserID: token.UserID, TokenID: token.ID, Source: token.Source, OperationID: op.ID, TokenVersion: version, Digest: digest, Preview: preview, StepUp: op.RequiresStepUp(arguments), State: "pending", CreatedAt: now, ExpiresAt: now.Add(confirmationTTL)}
 		if err := h.state.CreateApproval(ctx, approval); err != nil {
 			return nil, errors.New("confirmation storage is unavailable")
 		}
 		return approval, nil
 	}
 	approval, err := h.state.GetApproval(ctx, input.ConfirmationID)
-	if err != nil || approval.TokenID != token.ID || approval.UserID != token.UserID || approval.OperationID != op.ID || approval.Digest != digest || approval.TokenVersion != version || !time.Now().Before(approval.ExpiresAt) {
+	if err != nil || approval.Source != token.Source || approval.TokenID != token.ID || approval.UserID != token.UserID || approval.OperationID != op.ID || approval.Digest != digest || approval.TokenVersion != version || !time.Now().Before(approval.ExpiresAt) {
 		return nil, errors.New("confirmation does not match this request or has expired")
 	}
 	if approval.State == "consumed" {
@@ -285,7 +285,7 @@ func (h *Handler) request(ctx context.Context, token *identity.MCPToken, operati
 	for name, value := range input.Query {
 		query.Set(name, value)
 	}
-	dispatch := authctx.MCPDispatch{TokenID: token.ID, OperationID: operation.ID, Method: target.Method, Route: target.Path}
+	dispatch := authctx.MCPDispatch{TokenID: token.ID, Source: token.Source, Credential: token.Credential, OperationID: operation.ID, Method: target.Method, Route: target.Path}
 	dispatch.ConfirmationSkipped = operation.Sensitive && token.SkipBrowserConfirmation && approval == nil
 	if dispatch.ConfirmationSkipped {
 		// Bind direct execution to the opt-in version just observed, so disabling
@@ -316,7 +316,7 @@ func (h *Handler) request(ctx context.Context, token *identity.MCPToken, operati
 // file. Callers fill its bytes or streaming request and persist it
 // successfully before returning a download link.
 func (h *Handler) newArtifact(token *identity.MCPToken, operation string) *control.Artifact {
-	return &control.Artifact{ID: uuid.NewString(), UserID: token.UserID, TokenID: token.ID, OperationID: operation, ExpiresAt: time.Now().UTC().Add(artifactTTL)}
+	return &control.Artifact{ID: uuid.NewString(), UserID: token.UserID, TokenID: token.ID, Source: token.Source, OperationID: operation, ExpiresAt: time.Now().UTC().Add(artifactTTL)}
 }
 
 // artifactResult returns the browser delivery link for an already persisted

@@ -12,6 +12,8 @@ type mcpDispatchKey struct{}
 
 // MCPDispatch binds a verified MCP credential to one canonical administrative route.
 type MCPDispatch struct {
+	Source      string // credential authorization source discriminator
+	Credential  string // request-local OAuth access credential
 	TokenID     int64  // verified credential identifier
 	OperationID string // authorized operation identifier
 	Method      string // expected HTTP method

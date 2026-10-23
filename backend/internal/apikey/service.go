@@ -523,10 +523,10 @@ type APIKeyService struct {
 	// atomically. Start allocates enabled layers; teardown closes them after
 	// admitted operations and the subscriber finish. Their pointers remain stored
 	// afterward, so direct users coordinate access with resource lifetime.
-	authCacheL1         atomic.Pointer[ristretto.Cache] // atomic positive local cache pointer
-	authNegativeCacheL1 atomic.Pointer[ristretto.Cache] // atomic missing-credential cache pointer
-	authCfg             KeyApiKeyAuthCacheConfig        // captured cache enablement and lifetimes
-	authGroup           singleflight.Group              // shared same-credential load coordinator
+	authCacheL1         atomic.Pointer[ristretto.Cache[string, any]] // atomic positive local cache pointer
+	authNegativeCacheL1 atomic.Pointer[ristretto.Cache[string, any]] // atomic missing-credential cache pointer
+	authCfg             KeyApiKeyAuthCacheConfig                     // captured cache enablement and lifetimes
+	authGroup           singleflight.Group                           // shared same-credential load coordinator
 	// authLookupSlots bounds direct credential loads. A nil channel bypasses
 	// accounting; otherwise authLookupTotal counts attempts, authLookupRejected
 	// counts overload, and authLookupInFlight counts held positions sampled

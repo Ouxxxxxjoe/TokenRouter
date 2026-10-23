@@ -112,6 +112,12 @@
 
 迁移 283 只在站点名称、站点标题、发件人名称和支付商品前缀去掉首尾空白后恰好等于旧产品名时，把它们改成 TokenRouter。自定义的值、历史订单、邮件记录和已经绑定的 TOTP 密钥都保持不变。新绑定的 TOTP 显示 TokenRouter，旧的绑定继续用原来的密钥验证。
 
+### MCP OAuth
+
+`mcp.oauth.issuer_url` 或 `MCP_OAUTH_ISSUER_URL` 配置 MCP OAuth 的公开授权服务器 origin。留空关闭 OAuth；配置值使用 HTTPS，不包含路径、查询、片段或用户信息，回环 HTTP 可用于本地开发。所有实例使用同一个 origin，公开 `/mcp` 的 resource 从它派生，`api_base_url` 的展示设置不替代 issuer。
+
+OAuth 使用独立的持久签名密钥，启动时在 `security_secrets` 中生成或读取。`frontend_url` 决定授权页面及浏览器接续的前端地址；未配置时，OAuth 登录授权页面使用 issuer 所在站点。手工 MCP 令牌的固定 TOTP 加密密钥要求继续适用。具体端点、期限及客户端约束见 [MCP OAuth 应用授权](mcp_management.md#oauth_authorization)。
+
 ## 首次初始化
 
 setup 按 `DATA_DIR`、可写的 `/app/data`、当前目录的顺序，选择 `config.yaml` 和 `.installed` 的位置。正常情况下，配置文件和安装锁只要有一个存在，就不会重新开放初始化；`SKIP_SETUP` 是部署者手动跳过的开关。修改这套判断时，要保证"删掉一个文件也无法远程强制重装"。

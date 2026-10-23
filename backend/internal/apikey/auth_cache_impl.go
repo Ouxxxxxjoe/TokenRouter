@@ -137,7 +137,7 @@ func (s *APIKeyService) initAuthCaches() {
 		if s.authCfg.l1Size > 0 && s.authCfg.l1Size < negativeSize {
 			negativeSize = s.authCfg.l1Size
 		}
-		cache, err := ristretto.NewCache(&ristretto.Config{
+		cache, err := ristretto.NewCache(&ristretto.Config[string, any]{
 			NumCounters: int64(negativeSize) * 10,
 			MaxCost:     int64(negativeSize),
 			BufferItems: 64,
@@ -149,7 +149,7 @@ func (s *APIKeyService) initAuthCaches() {
 		}
 	}
 	if s.authCfg.KeyL1Enabled() {
-		cache, err := ristretto.NewCache(&ristretto.Config{
+		cache, err := ristretto.NewCache(&ristretto.Config[string, any]{
 			NumCounters: int64(s.authCfg.l1Size) * 10,
 			MaxCost:     int64(s.authCfg.l1Size),
 			BufferItems: 64,

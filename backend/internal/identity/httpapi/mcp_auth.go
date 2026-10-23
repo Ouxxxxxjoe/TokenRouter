@@ -29,7 +29,7 @@ func MCPAdminAuth(tokens *identity.MCPTokenService, normal gin.HandlerFunc) gin.
 			AbortWithError(c, 403, "MCP_ROUTE_MISMATCH", "Operation does not match the selected route")
 			return
 		}
-		token, user, err := tokens.AuthorizeID(c.Request.Context(), dispatch.TokenID)
+		token, user, err := tokens.AuthorizeReference(c.Request.Context(), dispatch.Source, dispatch.TokenID, dispatch.Credential)
 		if err != nil || !token.Allows(dispatch.OperationID) {
 			AbortWithError(c, 403, "MCP_OPERATION_FORBIDDEN", "Operation is not authorized")
 			return

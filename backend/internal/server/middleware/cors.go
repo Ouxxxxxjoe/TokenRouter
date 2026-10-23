@@ -79,7 +79,7 @@ func CORS(cfg httpconfig.CORSConfig) gin.HandlerFunc {
 		allowedSet[origin] = struct{}{}
 	}
 	allowHeaders := []string{
-		"Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization", "X-Creative-Workspace-ID", "Idempotency-Key",
+		"Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization", "X-Creative-Workspace-ID", "Idempotency-Key", "MCP-Protocol-Version", "Mcp-Session-Id", "Last-Event-ID",
 		"accept", "origin", "Cache-Control", "X-Requested-With", "X-API-Key", "X-Admin-UI-Request", "X-User-UI-Request",
 		"X-Request-ID", "X-Client-Request-ID",
 	}
@@ -113,7 +113,7 @@ func CORS(cfg httpconfig.CORSConfig) gin.HandlerFunc {
 			}
 			c.Writer.Header().Set("Access-Control-Allow-Headers", allowHeadersValue)
 			c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
-			c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Disposition, ETag, Server-Timing, X-Request-ID, X-TokenRouter-Request-ID, X-Sub2API-Request-ID, X-Client-Request-ID")
+			c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Disposition, WWW-Authenticate, Mcp-Session-Id, ETag, Server-Timing, X-Request-ID, X-TokenRouter-Request-ID, X-Sub2API-Request-ID, X-Client-Request-ID")
 			// Cache approved browser preflight permissions for one day.
 			c.Writer.Header().Set("Access-Control-Max-Age", "86400")
 		}

@@ -328,7 +328,7 @@ func TestAuthCacheInvalidationSubscriber_RetriesInitialFailureAndStops(t *testin
 	}}
 	svc := NewAPIKeyService(nil, nil, nil, nil, nil, cache, nil)
 	svc.Start()
-	localCache, err := ristretto.NewCache(&ristretto.Config{NumCounters: 10, MaxCost: 1, BufferItems: 64})
+	localCache, err := ristretto.NewCache(&ristretto.Config[string, any]{NumCounters: 10, MaxCost: 1, BufferItems: 64})
 	require.NoError(t, err)
 	// This local cache was supplied outside service startup. Close it after
 	// subscriber shutdown so its callbacks cannot read a resource already being closed.
@@ -366,7 +366,7 @@ func TestAuthCacheInvalidationSubscriber_ReconnectsAfterRuntimeDisconnect(t *tes
 	}}
 	svc := NewAPIKeyService(nil, nil, nil, nil, nil, cache, nil)
 	svc.Start()
-	localCache, err := ristretto.NewCache(&ristretto.Config{NumCounters: 10, MaxCost: 1, BufferItems: 64})
+	localCache, err := ristretto.NewCache(&ristretto.Config[string, any]{NumCounters: 10, MaxCost: 1, BufferItems: 64})
 	require.NoError(t, err)
 	// This local cache was supplied outside service startup. Close it after
 	// subscriber shutdown so its callbacks cannot read a resource already being closed.

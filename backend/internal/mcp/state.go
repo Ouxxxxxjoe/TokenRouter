@@ -10,7 +10,8 @@ import (
 // shared by MCP and administrator HTTP callers. Confirmation records contain
 // request digests and redacted previews; original sensitive arguments arrive
 // again with the approved tool retry. File ownership includes both the token
-// and administrator so an opaque identifier alone grants no access.
+// source and administrator so equal IDs from different authorization stores
+// cannot share protected results. Existing records with no source use manual tokens.
 
 // Call identifies one operation and separates URL arguments from its JSON body.
 type Call struct {
@@ -25,22 +26,24 @@ type Call struct {
 
 // Approval binds one administrator's confirmation to a token configuration and request.
 type Approval struct {
-	ID           string    `json:"id"`            // opaque confirmation identifier
-	UserID       int64     `json:"user_id"`       // required approving administrator
-	TokenID      int64     `json:"token_id"`      // requesting credential identifier
-	OperationID  string    `json:"operation_id"`  // confirmed operation permission
-	TokenVersion string    `json:"token_version"` // token settings timestamp
-	Digest       string    `json:"digest"`        // normalized request SHA256
-	Preview      string    `json:"preview"`       // redacted JSON argument display
-	StepUp       bool      `json:"step_up"`       // verification required for this request
-	State        string    `json:"state"`         // pending approved or consumed
-	SessionID    string    `json:"session_id"`    // verified approving browser session
-	CreatedAt    time.Time `json:"created_at"`    // confirmation creation instant
-	ExpiresAt    time.Time `json:"expires_at"`    // absolute confirmation expiry
+	Source       string    `json:"source,omitempty"` // empty identifies manual credentials
+	ID           string    `json:"id"`               // opaque confirmation identifier
+	UserID       int64     `json:"user_id"`          // required approving administrator
+	TokenID      int64     `json:"token_id"`         // requesting credential identifier
+	OperationID  string    `json:"operation_id"`     // confirmed operation permission
+	TokenVersion string    `json:"token_version"`    // token settings timestamp
+	Digest       string    `json:"digest"`           // normalized request SHA256
+	Preview      string    `json:"preview"`          // redacted JSON argument display
+	StepUp       bool      `json:"step_up"`          // verification required for this request
+	State        string    `json:"state"`            // pending approved or consumed
+	SessionID    string    `json:"session_id"`       // verified approving browser session
+	CreatedAt    time.Time `json:"created_at"`       // confirmation creation instant
+	ExpiresAt    time.Time `json:"expires_at"`       // absolute confirmation expiry
 }
 
 // Artifact stores encrypted temporary result bytes or an authenticated streaming request.
 type Artifact struct {
+	Source       string    `json:"source,omitempty"`        // empty identifies manual credentials
 	ID           string    `json:"id"`                      // opaque owned file identifier
 	UserID       int64     `json:"user_id"`                 // owning administrator identifier
 	TokenID      int64     `json:"token_id"`                // originating credential identifier

@@ -4,6 +4,43 @@
 
 export default {
   mcp: {
+    oauth: {
+      requestExpires: 'Request expires',
+      authorizationExpires: 'Authorization expires',
+      search: 'Search applications',
+      name: 'Application name',
+      edit: 'Edit application authorization',
+      revoke: 'Revoke application',
+      revokeMessage:
+        'Revoke access for {name}? Its current connection and refresh credentials will stop working.',
+
+      empty: 'No applications authorized yet. Connect from your MCP client to authorize one.',
+      tokens: 'Manual tokens',
+      applications: 'Authorized applications',
+      client: 'Client identifier',
+      application: 'Application',
+      account: 'Signed-in account',
+      callback: 'Return address',
+      connectionExpires: 'Connection expires',
+      reconnect: 'Reconnect required',
+      connectionTitle: 'Connect with OAuth',
+      connectionHint:
+        'Enter this MCP URL in your client and choose OAuth. Sign in to review and authorize its access.',
+      disabled:
+        'OAuth is disabled. Set MCP_OAUTH_ISSUER_URL to the public HTTPS origin of this server.',
+      authorizeTitle: 'Authorize an application',
+      authorizeHint:
+        'Review the application and choose which management operations it can perform.',
+      identityHint:
+        'Check the client identifier and return address. An application name alone does not verify who operates it.',
+      lifetimeHint:
+        'Authorization remains until you revoke it. The client must reconnect after 30 days without refreshing its connection.',
+      expired: 'This authorization request expired. Return to your client and connect again.',
+      deny: 'Deny',
+      authorize: 'Authorize',
+      callbackInvalid: 'The return address changed. Reconnect from your client.',
+    },
+
     authMethod: 'MCP access token',
     token: 'Access token',
     auditShort: 'Audit',

@@ -19,14 +19,16 @@ import (
 	"github.com/TokenFlux/TokenRouter/internal/audit"
 	"github.com/TokenFlux/TokenRouter/internal/identity"
 	identityhttp "github.com/TokenFlux/TokenRouter/internal/identity/httpapi"
+	"github.com/TokenFlux/TokenRouter/internal/identity/provider"
 	control "github.com/TokenFlux/TokenRouter/internal/mcp"
 	"github.com/TokenFlux/TokenRouter/internal/server/adminapi"
 )
 
 // transport.go exposes the four management tools through the official MCP
 // Streamable HTTP implementation. Every HTTP request authenticates a dedicated
-// token and validates any supplied browser Origin before the SDK receives it.
-// Stateless transport ties authorization to each request.
+// credential and validates supplied browser Origins before SDK dispatch. Manual
+// tokens and OAuth access credentials resolve source-qualified stable grant IDs.
+// Stateless transport ties current credential and grant checks to each request.
 // The tools discover and execute only operations granted by the current token.
 //
 // The handler is assembled before routing and receives its immutable catalogue
@@ -51,6 +53,8 @@ type requestIdentityKey struct{}
 // requestIdentity retains verified ownership and HTTP correlation for one tool request.
 type requestIdentity struct {
 	TokenID    int64  // authenticated credential identifier
+	Source     string // credential authorization source discriminator
+	Credential string // request-local OAuth access credential
 	RemoteAddr string // original transport peer address
 	UserAgent  string // original client user agent
 }
@@ -80,6 +84,7 @@ type RequestLimiter interface {
 
 // Options provides shared admission and public browser-link policy to the transport.
 type Options struct {
+	OAuth          *provider.MCPOAuthServer       // optional application authorization server
 	Origins        func(context.Context) []string // allowed browser origin reader
 	BrowserBaseURL func(context.Context) string   // configured public frontend URL
 	Limiter        RequestLimiter                 // shared token request limiter
@@ -138,6 +143,7 @@ func toolSchema[T any]() *jsonschema.Schema {
 func (h *Handler) Mount(router *gin.Engine, admin, auditLog gin.HandlerFunc) error {
 	h.router = router
 	h.registerManagement(router.Group("/api/v1/admin/mcp", admin, auditLog))
+	h.mountOAuth(router, router.Group("/api/v1/admin/mcp", admin, auditLog))
 	catalog, err := adminapi.FromRoutes(router.Routes())
 	if err != nil {
 		return err
@@ -160,20 +166,21 @@ func (h *Handler) serveMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Fields(r.Header.Get("Authorization"))
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		w.Header().Set("WWW-Authenticate", "Bearer")
+		w.Header().Set("WWW-Authenticate", h.oauthChallenge(""))
 		http.Error(w, "MCP access token required", http.StatusUnauthorized)
 		return
 	}
 	token, _, err := h.tokens.Authenticate(r.Context(), parts[1])
 	if err != nil {
+		w.Header().Set("WWW-Authenticate", h.oauthChallenge("invalid_token"))
 		http.Error(w, "MCP access token is invalid or expired", http.StatusUnauthorized)
 		return
 	}
-	ctx := context.WithValue(r.Context(), requestIdentityKey{}, requestIdentity{TokenID: token.ID, RemoteAddr: r.RemoteAddr, UserAgent: r.UserAgent()})
+	ctx := context.WithValue(r.Context(), requestIdentityKey{}, requestIdentity{TokenID: token.ID, Source: token.Source, Credential: token.Credential, RemoteAddr: r.RemoteAddr, UserAgent: r.UserAgent()})
 	if h.options.Limiter != nil {
 		// Dedicated credentials remain bounded even when ordinary administrator panel
 		// requests are exempt from panel limits. Counting failure rejects further tool admission.
-		allowed, _, retry, err := h.options.Limiter.Allow(ctx, strconv.FormatInt(token.ID, 10), 300, time.Minute)
+		allowed, _, retry, err := h.options.Limiter.Allow(ctx, token.Source+":"+strconv.FormatInt(token.ID, 10), 300, time.Minute)
 		if err != nil {
 			http.Error(w, "MCP admission is unavailable", http.StatusServiceUnavailable)
 			return
@@ -220,7 +227,7 @@ func (h *Handler) current(ctx context.Context) (*identity.MCPToken, *identity.Us
 	if !ok {
 		return nil, nil, errors.New("MCP authentication required")
 	}
-	return h.tokens.AuthorizeID(ctx, caller.TokenID)
+	return h.tokens.AuthorizeReference(ctx, caller.Source, caller.TokenID, caller.Credential)
 }
 
 // search returns a bounded page of granted operation summaries in stable order.
@@ -319,4 +326,18 @@ func toolFailure(err error) *mcp.CallToolResult {
 // checkBrowserStepUp applies the existing administrator TOTP policy to a confirmation.
 func (h *Handler) checkBrowserStepUp(c *gin.Context) bool {
 	return identityhttp.EnforceStepUp(c, h.totp, h.users, h.settings)
+}
+
+// oauthChallenge advertises the configured discovery endpoint for unauthenticated clients.
+// Manual-only deployments retain the ordinary Bearer challenge. OAuth deployments
+// use a fixed resource URL and never derive discovery links from request headers.
+func (h *Handler) oauthChallenge(reason string) string {
+	if h.options.OAuth == nil || !h.options.OAuth.Enabled() {
+		return "Bearer"
+	}
+	challenge := "Bearer resource_metadata=" + strconv.Quote(h.options.OAuth.Issuer()+"/.well-known/oauth-protected-resource/mcp") + ", scope=\"mcp\""
+	if reason != "" {
+		challenge += ", error=" + strconv.Quote(reason)
+	}
+	return challenge
 }

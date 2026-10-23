@@ -1,0 +1,513 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
+
+	"github.com/TokenFlux/TokenRouter/internal/identity"
+	"github.com/TokenFlux/TokenRouter/internal/identity/httpapi/authctx"
+	"github.com/TokenFlux/TokenRouter/internal/identity/postgres"
+	"github.com/TokenFlux/TokenRouter/internal/identity/provider"
+	"github.com/TokenFlux/TokenRouter/internal/testutil/postgrescontainer"
+)
+
+// oauth_integration_test.go exercises the mounted protocol with real PostgreSQL
+// transactions and the official MCP OAuth client. Browser JWT admission uses
+// the existing verified-session fixture; account role checks, OAuth storage,
+// signatures, PKCE, consent consumption, and credential rotation are production code.
+
+// oauthFixture retains one migrated OAuth server and its manual-token MCP fixture.
+type oauthFixture struct {
+	repo        *postgres.MCPOAuthStore  // migrated OAuth fixture repository
+	*mcpFixture                          // existing tool and browser fixtures
+	db          *sql.DB                  // migrated PostgreSQL database connection
+	oauth       *provider.MCPOAuthServer // real OAuth protocol implementation
+	http        *httptest.Server         // canonical OAuth and MCP server
+	userID      int64                    // persisted administrator account identifier
+}
+
+// oauthLimiterFixture isolates protocol persistence tests from Redis admission limits.
+type oauthLimiterFixture struct{}
+
+// newOAuthFixture mounts OAuth beside the existing production MCP handler.
+// Each test owns an isolated migrated database. OAuth and manual grants both
+// begin at numeric identifier one so cross-source ownership checks are exercised.
+func newOAuthFixture(t *testing.T) *oauthFixture {
+	t.Helper()
+	base := newMCPFixture(t)
+	db := postgrescontainer.New(t)
+	var id int64
+	require.NoError(t, db.QueryRow(`INSERT INTO users(email,password_hash,role,status) VALUES('oauth@example.invalid','unused','admin','active') RETURNING id`).Scan(&id))
+	router, ok := base.handler.router.(*gin.Engine)
+	require.True(t, ok)
+	server := httptest.NewUnstartedServer(router)
+	issuer := "http://" + server.Listener.Addr().String()
+	repo := postgres.NewMCPOAuthStore(db)
+	oauth := provider.NewMCPOAuthServer(repo, base.accounts, issuer, bytes.Repeat([]byte{7}, 32))
+	base.handler.options.OAuth = oauth
+	base.handler.options.Limiter = &oauthLimiterFixture{}
+	base.handler.tokens.SetOAuth(oauth)
+	// Public protocol routes are added before starting this listener. Existing
+	// browser routes remain owned by the original fixture's authenticated middleware.
+	base.handler.mountOAuth(router, router.Group("/api/v1/admin/mcp", func(c *gin.Context) {
+		if c.GetHeader("Authorization") != "Bearer browser" {
+			c.AbortWithStatus(401)
+			return
+		}
+		authctx.SetPrincipal(c, identity.Principal{UserID: id, Role: identity.RoleAdmin, CredentialKind: "jwt", SessionID: "fixture-session"}, 1, "oauth@example.invalid")
+		c.Next()
+	}))
+	server.Start()
+	t.Cleanup(server.Close)
+	return &oauthFixture{mcpFixture: base, repo: repo, db: db, oauth: oauth, http: server, userID: id}
+}
+
+// register creates a public OAuth client through the actual dynamic registration endpoint.
+func (f *oauthFixture) register(t *testing.T) string {
+	t.Helper()
+	body := `{"client_name":"Fixture MCP","redirect_uris":["http://127.0.0.1:43111/callback"],"grant_types":["authorization_code","refresh_token"],"token_endpoint_auth_method":"none"}`
+	response, err := http.Post(f.http.URL+"/mcp/oauth/register", "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, response.Body.Close()) }()
+	var data map[string]any
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&data))
+	require.Equal(t, 201, response.StatusCode, data)
+	return oauthString(t, data, "client_id")
+}
+
+// consent opens the real authorization endpoint and completes the bound browser decision.
+// The fixture supplies a verified JWT session to the real review and decision
+// HTTP handlers, then preserves callback state and issuer for the SDK to validate.
+func (f *oauthFixture) consent(t *testing.T, target string) *url.URL {
+	t.Helper()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Get(target)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, response.Body.Close()) }()
+	raw, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, 302, response.StatusCode, string(raw))
+	redirect, err := url.Parse(response.Header.Get("Location"))
+	require.NoError(t, err)
+	reviewResponse := f.browser(t, http.MethodGet, "/api/v1/admin/mcp/oauth/requests/"+redirect.Query().Get("request"), "browser")
+	require.Equal(t, http.StatusOK, reviewResponse.StatusCode)
+	var review struct {
+		Data provider.MCPOAuthReview `json:"data"` // authenticated browser review data
+	}
+	require.NoError(t, json.NewDecoder(reviewResponse.Body).Decode(&review))
+	require.NoError(t, reviewResponse.Body.Close())
+	decision, err := json.Marshal(map[string]any{"nonce": review.Data.Nonce, "approve": true, "permissions": []string{"fixture.get", "fixture.protected", "mcp.confirmations.get", "mcp.files.upload"}})
+	require.NoError(t, err)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, f.http.URL+"/api/v1/admin/mcp/oauth/requests/"+review.Data.Request.ID+"/decision", bytes.NewReader(decision))
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer browser")
+	request.Header.Set("Content-Type", "application/json")
+	decisionResponse, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	var outcome struct {
+		Data struct {
+			RedirectURI string `json:"redirect_uri"` // validated client callback address
+		} `json:"data"` // committed browser decision result
+	}
+	require.NoError(t, json.NewDecoder(decisionResponse.Body).Decode(&outcome))
+	require.NoError(t, decisionResponse.Body.Close())
+	require.Equal(t, http.StatusOK, decisionResponse.StatusCode)
+	callback := outcome.Data.RedirectURI
+	parsed, err := url.Parse(callback)
+	require.NoError(t, err)
+	require.Equal(t, f.http.URL, parsed.Query().Get("iss"))
+	return parsed
+}
+
+// code creates a fresh PKCE-bound authorization code for the supplied client.
+func (f *oauthFixture) code(t *testing.T, clientID string) (string, string) {
+	t.Helper()
+	verifier := strings.Repeat("v", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	values := url.Values{"client_id": {clientID}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "response_type": {"code"}, "scope": {"mcp offline_access"}, "state": {"fixture-state-123456"}, "code_challenge_method": {"S256"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "resource": {f.oauth.Resource()}}
+	return f.consent(t, f.http.URL+"/mcp/oauth/authorize?"+values.Encode()).Query().Get("code"), verifier
+}
+
+// exchange submits token parameters and returns the raw protocol status and decoded body.
+func (f *oauthFixture) exchange(t *testing.T, values url.Values) (int, map[string]any) {
+	t.Helper()
+	response, err := http.PostForm(f.http.URL+"/mcp/oauth/token", values)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, response.Body.Close()) }()
+	var data map[string]any
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&data))
+	return response.StatusCode, data
+}
+
+// TestOAuthSDKDiscoveryAndInvocation follows discovery, dynamic registration, browser
+// approval, PKCE exchange, and a management query with the official SDK. The
+// successful request proves the issued credential reaches the existing tool dispatcher.
+func TestOAuthSDKDiscoveryAndInvocation(t *testing.T) {
+	f := newOAuthFixture(t)
+	handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{DynamicClientRegistrationConfig: &auth.DynamicClientRegistrationConfig{Metadata: &oauthex.ClientRegistrationMetadata{ClientName: "Official SDK", RedirectURIs: []string{"http://127.0.0.1:43111/callback"}, GrantTypes: []string{"authorization_code", "refresh_token"}, TokenEndpointAuthMethod: "none"}}, RequestRefreshToken: true, NewTokenSource: func(ctx context.Context, config *oauth2.Config, token *oauth2.Token) (oauth2.TokenSource, error) {
+		// Force the SDK's standard refresh path before its first MCP request;
+		// golang.org/x/oauth2 omits resource and inherits the stored family audience.
+		token.Expiry = time.Now().Add(-time.Minute)
+		return config.TokenSource(ctx, token), nil
+	}, AuthorizationCodeFetcher: func(_ context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
+		callback := f.consent(t, args.URL)
+		return &auth.AuthorizationResult{Code: callback.Query().Get("code"), State: callback.Query().Get("state"), Iss: callback.Query().Get("iss")}, nil
+	}})
+	require.NoError(t, err)
+	// The SDK OAuth transport owns discovery and token exchange before MCP initialization.
+	client := mcp.NewClient(&mcp.Implementation{Name: "OAuth acceptance", Version: "1"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: f.http.URL + "/mcp", OAuthHandler: handler, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, session.Close()) }()
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "read_operation", Arguments: map[string]any{"operation_id": "fixture.get", "path": map[string]string{"id": "42"}}})
+	require.NoError(t, err)
+	require.False(t, result.IsError, result)
+}
+
+// TestOAuthRotationReplayAndLiveGrants exchanges real credentials and rotates the
+// refresh token. Replaying the previous refresh revokes the entire family,
+// while a failed PKCE attempt leaves the unconsumed code available for correction.
+func TestOAuthRotationReplayAndLiveGrants(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	values := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {"incorrect"}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}}
+	status, _ := f.exchange(t, values)
+	require.Equal(t, 400, status)
+	values.Set("code_verifier", verifier)
+	exchangeStarted := time.Now()
+	status, data := f.exchange(t, values)
+	require.Equal(t, 200, status, data)
+	access := oauthString(t, data, "access_token")
+	refresh := oauthString(t, data, "refresh_token")
+	grant, err := f.oauth.Authenticate(t.Context(), access)
+	require.NoError(t, err)
+	require.Equal(t, "oauth", grant.Source)
+	// Protocol TTL rounds down and excludes time spent processing the exchange.
+	require.InDelta(t, 900, data["expires_in"], 1+time.Since(exchangeStarted).Seconds())
+	values = url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refresh}, "resource": {f.oauth.Resource()}}
+	status, next := f.exchange(t, values)
+	require.Equal(t, 200, status, next)
+	current, err := f.oauth.Authenticate(t.Context(), oauthString(t, next, "access_token"))
+	require.NoError(t, err)
+	require.Equal(t, grant.ID, current.ID)
+	status, _ = f.exchange(t, values)
+	require.Equal(t, 400, status)
+	_, err = f.oauth.Authenticate(t.Context(), oauthString(t, next, "access_token"))
+	require.Error(t, err)
+	_, err = f.oauth.Authenticate(t.Context(), access)
+	require.Error(t, err)
+	var leaked int
+	require.NoError(t, f.db.QueryRow(`SELECT COUNT(*) FROM mcp_oauth_sessions WHERE payload::text LIKE $1 OR payload::text LIKE $2`, "%"+access+"%", "%"+refresh+"%").Scan(&leaked))
+	require.Zero(t, leaked)
+}
+
+// TestOAuthConcurrentCodeConsumption submits one authorization code simultaneously.
+// PostgreSQL locking permits one successful exchange; replay detection rejects the
+// duplicate and revokes any credentials that the first exchange already created.
+func TestOAuthConcurrentCodeConsumption(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	values := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}}
+	var wg sync.WaitGroup
+	statuses := make(chan int, 2)
+	for range 2 {
+		wg.Go(func() { status, _ := f.exchange(t, values); statuses <- status })
+	}
+	wg.Wait()
+	close(statuses)
+	successes := 0
+	for status := range statuses {
+		if status == 200 {
+			successes++
+		} else {
+			require.Equal(t, 400, status)
+		}
+	}
+	require.Equal(t, 1, successes)
+}
+
+// Allow admits fixture protocol requests while real rate-limit behavior has separate tests.
+func (*oauthLimiterFixture) Allow(context.Context, string, int, time.Duration) (bool, int64, time.Duration, error) {
+	return true, 0, 0, nil
+}
+
+// TestOAuthApprovalSurvivesRefreshAndRejectsNarrowing binds a sensitive operation
+// to the stable application grant, rotates its credential, and resumes approval.
+// A later permission update invalidates another pending confirmation immediately.
+func TestOAuthApprovalSurvivesRefreshAndRejectsNarrowing(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+	require.Equal(t, 200, status, pair)
+	first := oauthString(t, pair, "access_token")
+	client := mcp.NewClient(&mcp.Implementation{Name: "OAuth confirmation", Version: "1"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: f.http.URL + "/mcp", HTTPClient: &http.Client{Transport: bearerTransport{first}}, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, session.Close()) }()
+	arguments := map[string]any{"operation_id": "fixture.protected", "body": map[string]any{"value": "fixture"}}
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "execute_operation", Arguments: arguments})
+	require.NoError(t, err)
+	require.False(t, result.IsError, result)
+	data := oauthResultMap(t, result)
+	require.Equal(t, "confirmation_required", data["status"])
+	confirmation := oauthString(t, data, "confirmation_id")
+	status, next := f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {oauthString(t, pair, "refresh_token")}})
+	require.Equal(t, 200, status, next)
+	response := f.browser(t, http.MethodPost, "/api/v1/admin/mcp/confirmations/"+confirmation+"/approve", "browser")
+	require.Equal(t, 200, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+	refreshed, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: f.http.URL + "/mcp", HTTPClient: &http.Client{Transport: bearerTransport{oauthString(t, next, "access_token")}}, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, refreshed.Close()) }()
+	arguments["confirmation_id"] = confirmation
+	result, err = refreshed.CallTool(t.Context(), &mcp.CallToolParams{Name: "execute_operation", Arguments: arguments})
+	require.NoError(t, err)
+	require.False(t, result.IsError, result)
+	require.Equal(t, int64(1), f.writes.Load())
+	delete(arguments, "confirmation_id")
+	result, err = refreshed.CallTool(t.Context(), &mcp.CallToolParams{Name: "execute_operation", Arguments: arguments})
+	require.NoError(t, err)
+	pending := oauthString(t, oauthResultMap(t, result), "confirmation_id")
+	grants, err := f.repo.ListGrants(t.Context(), f.userID)
+	require.NoError(t, err)
+	grant := grants[0]
+	_, err = f.repo.UpdateGrant(t.Context(), f.userID, grant.ID, identity.MCPTokenInput{Name: grant.Name, Enabled: true, Permissions: []string{"fixture.get"}, ExpectedUpdatedAt: &grant.UpdatedAt})
+	require.NoError(t, err)
+	response = f.browser(t, http.MethodPost, "/api/v1/admin/mcp/confirmations/"+pending+"/approve", "browser")
+	require.Equal(t, 403, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+	arguments["confirmation_id"] = pending
+	result, err = refreshed.CallTool(t.Context(), &mcp.CallToolParams{Name: "execute_operation", Arguments: arguments})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	require.Equal(t, int64(1), f.writes.Load())
+	// OAuth grants and manual credentials intentionally share numeric identifiers;
+	// the existing manual credential remains valid after the application is revoked.
+	require.NoError(t, f.repo.RevokeGrant(t.Context(), f.userID, grant.ID))
+	_, _, err = f.handler.tokens.Authenticate(t.Context(), f.credential)
+	require.NoError(t, err)
+	_, err = f.oauth.Authenticate(t.Context(), oauthString(t, next, "access_token"))
+	require.Error(t, err)
+}
+
+// TestOAuthClientResourceBindingAndRevocation checks that an intercepted code
+// cannot move between clients or resource audiences. Correct revocation rejects
+// later access, while another client's revocation request cannot affect the family.
+func TestOAuthClientResourceBindingAndRevocation(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	other := f.register(t)
+	code, verifier := f.code(t, clientID)
+	values := url.Values{"grant_type": {"authorization_code"}, "client_id": {other}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}}
+	status, _ := f.exchange(t, values)
+	require.Equal(t, 400, status)
+	values.Set("client_id", clientID)
+	values.Set("resource", "https://another.example/mcp")
+	status, _ = f.exchange(t, values)
+	require.Equal(t, 400, status)
+	values.Set("resource", f.oauth.Resource())
+	status, pair := f.exchange(t, values)
+	require.Equal(t, 200, status, pair)
+	access := oauthString(t, pair, "access_token")
+	refresh := oauthString(t, pair, "refresh_token")
+	response, err := http.PostForm(f.http.URL+"/mcp/oauth/revoke", url.Values{"client_id": {other}, "token": {refresh}, "token_type_hint": {"refresh_token"}})
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	_, err = f.oauth.Authenticate(t.Context(), access)
+	require.NoError(t, err)
+	response, err = http.PostForm(f.http.URL+"/mcp/oauth/revoke", url.Values{"client_id": {clientID}, "token": {refresh}, "token_type_hint": {"refresh_token"}})
+	require.NoError(t, err)
+	require.Equal(t, 200, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+	_, err = f.oauth.Authenticate(t.Context(), access)
+	require.Error(t, err)
+}
+
+// TestOAuthConsentSessionIsolationAndExpiry binds a ticket to one browser session.
+// A different session, wrong nonce, repeat decision, or expired request cannot
+// create credentials; denial consumes the request without creating an application grant.
+func TestOAuthConsentSessionIsolationAndExpiry(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	client, err := f.repo.GetClient(t.Context(), clientID)
+	require.NoError(t, err)
+	verifier := strings.Repeat("z", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	pending := &identity.MCPOAuthPending{ID: "consent-ticket", Client: *client, ExpiresAt: time.Now().Add(time.Minute), Form: url.Values{"client_id": {clientID}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "response_type": {"code"}, "scope": {"mcp"}, "state": {"state-with-enough-entropy"}, "resource": {f.oauth.Resource()}, "code_challenge_method": {"S256"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}}}
+	require.NoError(t, f.repo.PutPending(t.Context(), pending))
+	review, err := f.oauth.Review(t.Context(), pending.ID, f.userID, "browser-a")
+	require.NoError(t, err)
+	_, err = f.oauth.Review(t.Context(), pending.ID, f.userID, "browser-b")
+	require.Error(t, err)
+	_, err = f.oauth.Decide(t.Context(), pending.ID, f.userID, "browser-a", "wrong", true, []string{"fixture.get"})
+	require.Error(t, err)
+	callback, err := f.oauth.Decide(t.Context(), pending.ID, f.userID, "browser-a", review.Nonce, false, nil)
+	require.NoError(t, err)
+	parsed, err := url.Parse(callback)
+	require.NoError(t, err)
+	require.Equal(t, "access_denied", parsed.Query().Get("error"))
+	require.Equal(t, f.http.URL, parsed.Query().Get("iss"))
+	_, err = f.oauth.Decide(t.Context(), pending.ID, f.userID, "browser-a", review.Nonce, true, []string{"fixture.get"})
+	require.Error(t, err)
+	grants, err := f.repo.ListGrants(t.Context(), f.userID)
+	require.NoError(t, err)
+	require.Empty(t, grants)
+	pending.ID = "expired-ticket"
+	pending.ExpiresAt = time.Now().Add(-time.Minute)
+	require.NoError(t, f.repo.PutPending(t.Context(), pending))
+	_, err = f.oauth.Review(t.Context(), pending.ID, f.userID, "browser-a")
+	require.Error(t, err)
+	require.NoError(t, f.repo.Cleanup(t.Context()))
+	var count int
+	require.NoError(t, f.db.QueryRow(`SELECT COUNT(*) FROM mcp_oauth_pending WHERE id='expired-ticket'`).Scan(&count))
+	require.Zero(t, count)
+}
+
+// TestOAuthConfidentialClientAuthentication covers both advertised secret authentication
+// methods. A missing secret cannot exchange the code, and successful retries
+// use the registered method while persistence contains a verifier rather than plaintext.
+func TestOAuthConfidentialClientAuthentication(t *testing.T) {
+	f := newOAuthFixture(t)
+	for _, method := range []string{"client_secret_basic", "client_secret_post"} {
+		t.Run(method, func(t *testing.T) {
+			metadata := map[string]any{"client_name": "Confidential client", "redirect_uris": []string{"http://127.0.0.1:43111/callback"}, "grant_types": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_method": method}
+			raw, err := json.Marshal(metadata)
+			require.NoError(t, err)
+			response, err := http.Post(f.http.URL+"/mcp/oauth/register", "application/json", bytes.NewReader(raw))
+			require.NoError(t, err)
+			var registration map[string]any
+			require.NoError(t, json.NewDecoder(response.Body).Decode(&registration))
+			require.NoError(t, response.Body.Close())
+			require.Equal(t, 201, response.StatusCode, registration)
+			clientID := oauthString(t, registration, "client_id")
+			secret := oauthString(t, registration, "client_secret")
+			code, verifier := f.code(t, clientID)
+			values := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}}
+			status, _ := f.exchange(t, values)
+			require.NotEqual(t, 200, status)
+			if method == "client_secret_post" {
+				values.Set("client_secret", secret)
+			}
+			request, err := http.NewRequest(http.MethodPost, f.http.URL+"/mcp/oauth/token", strings.NewReader(values.Encode()))
+			require.NoError(t, err)
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if method == "client_secret_basic" {
+				request.SetBasicAuth(clientID, secret)
+			}
+			response, err = http.DefaultClient.Do(request)
+			require.NoError(t, err)
+			var pair map[string]any
+			require.NoError(t, json.NewDecoder(response.Body).Decode(&pair))
+			require.NoError(t, response.Body.Close())
+			require.Equal(t, 200, response.StatusCode, pair)
+			stored, err := f.repo.GetClient(t.Context(), clientID)
+			require.NoError(t, err)
+			require.NotEqual(t, secret, string(stored.SecretHash))
+			_, err = f.oauth.Authenticate(t.Context(), oauthString(t, pair, "access_token"))
+			require.NoError(t, err)
+		})
+	}
+}
+
+// oauthString requires a string-valued protocol field before returning its content.
+func oauthString(t *testing.T, data map[string]any, key string) string {
+	t.Helper()
+	value, ok := data[key].(string)
+	require.True(t, ok, "expected string field %s in %v", key, data)
+	return value
+}
+
+// oauthResultMap requires the SDK result's decoded structured management response.
+func oauthResultMap(t *testing.T, result *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	value, ok := result.StructuredContent.(map[string]any)
+	require.True(t, ok)
+	return value
+}
+
+// TestOAuthCIMDClientUsesStableIdentity connects a URL-identified application with
+// the official SDK. The verified document cache supplies ChatGPT-shaped identity
+// and callbacks; no dynamic registration or external network fetch is required.
+func TestOAuthCIMDClientUsesStableIdentity(t *testing.T) {
+	f := newOAuthFixture(t)
+	expires := time.Now().Add(5 * time.Minute)
+	const clientID = "https://chatgpt.com/oauth/client.json"
+	const callbackURI = "https://chatgpt.com/connector_platform_oauth_redirect"
+	require.NoError(t, f.repo.PutClient(t.Context(), &identity.MCPOAuthClient{ID: clientID, Name: "ChatGPT", RedirectURIs: []string{callbackURI}, GrantTypes: []string{"authorization_code", "refresh_token"}, AuthMethod: "none", ExpiresAt: &expires}))
+	handler, err := auth.NewAuthorizationCodeHandler(&auth.AuthorizationCodeHandlerConfig{ClientIDMetadataDocumentConfig: &auth.ClientIDMetadataDocumentConfig{URL: clientID}, RedirectURL: callbackURI, RequestRefreshToken: true, AuthorizationCodeFetcher: func(_ context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
+		callback := f.consent(t, args.URL)
+		require.Equal(t, "chatgpt.com", callback.Host)
+		return &auth.AuthorizationResult{Code: callback.Query().Get("code"), State: callback.Query().Get("state"), Iss: callback.Query().Get("iss")}, nil
+	}})
+	require.NoError(t, err)
+	client := mcp.NewClient(&mcp.Implementation{Name: "CIMD acceptance", Version: "1"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: f.http.URL + "/mcp", OAuthHandler: handler, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, session.Close()) }()
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "search_operations", Arguments: map[string]any{}})
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+	grants, err := f.repo.ListGrants(t.Context(), f.userID)
+	require.NoError(t, err)
+	require.Len(t, grants, 1)
+	require.Equal(t, clientID, grants[0].ClientID)
+}
+
+// TestOAuthUploadUsesCurrentAuthorization uploads JSON without exposing the opaque
+// grant's internal identifier to its client. The file belongs to the OAuth
+// source even when a manual token has the same ID, and revocation blocks download.
+func TestOAuthUploadUsesCurrentAuthorization(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+	require.Equal(t, 200, status, pair)
+	client := mcp.NewClient(&mcp.Implementation{Name: "OAuth files", Version: "1"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: f.http.URL + "/mcp", HTTPClient: &http.Client{Transport: bearerTransport{oauthString(t, pair, "access_token")}}, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, session.Close()) }()
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "execute_operation", Arguments: map[string]any{"operation_id": "mcp.files.upload", "body": map[string]any{"operation_id": "fixture.get", "name": "args.json", "data": base64.StdEncoding.EncodeToString([]byte(`{"id":"from-file"}`))}}})
+	require.NoError(t, err)
+	require.False(t, result.IsError, result)
+	envelope := jsonTestValue[map[string]any](t, oauthResultMap(t, result)["data"])
+	data := jsonTestValue[map[string]any](t, envelope["data"])
+	fileID := oauthString(t, data, "file_id")
+	file, err := f.handler.state.GetArtifact(t.Context(), fileID)
+	require.NoError(t, err)
+	require.Equal(t, "oauth", file.Source)
+	require.Equal(t, f.token.ID, file.TokenID)
+	response := f.browser(t, http.MethodGet, "/api/v1/admin/mcp/files/"+fileID, "browser")
+	require.Equal(t, 200, response.StatusCode)
+	raw, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.JSONEq(t, `{"id":"from-file"}`, string(raw))
+	require.NoError(t, f.repo.RevokeGrant(t.Context(), f.userID, file.TokenID))
+	response = f.browser(t, http.MethodGet, "/api/v1/admin/mcp/files/"+fileID, "browser")
+	require.Equal(t, 403, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+}

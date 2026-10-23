@@ -143,8 +143,8 @@ var managementOperations = map[string]*adminapi.Operation{
 		Module:  "mcp",
 		Title:   "Upload MCP request file",
 		TitleZH: "上传请求文件",
-		Description: "Upload a JSON body as base64 for a granted operation and owned token. The resulting file_id " +
-			"can replace body in the operation call.",
+		Description: "Upload a JSON body as base64 for a granted operation. MCP calls use the current authorization; " +
+			"browser calls supply token_id and its source. The resulting file_id can replace body in the operation call.",
 		Method: "POST",
 		Path:   "/api/v1/admin/mcp/files",
 		Input:  adminapi.Arguments("/api/v1/admin/mcp/files", nil, (*fileInput)(nil)),
@@ -167,7 +167,10 @@ var managementOperations = map[string]*adminapi.Operation{
 
 // fileInput supplies an owned JSON request body through the shared file workflow.
 type fileInput struct {
-	TokenID     int64  `json:"token_id" binding:"required"`     // owned target token
+	// Source and TokenID select a browser upload target. Internal MCP uploads
+	// infer both from verified dispatch identity when omitted and cannot select another grant.
+	Source      string `json:"source,omitempty"`                // empty identifies manual credentials
+	TokenID     int64  `json:"token_id,omitempty"`              // owned target token
 	OperationID string `json:"operation_id" binding:"required"` // permitted target operation
 	Name        string `json:"name"`                            // suggested file display name
 	Data        string `json:"data" binding:"required"`         // base64 encoded JSON
@@ -238,7 +241,7 @@ func (h *Handler) tokenInput(c *gin.Context) (identity.MCPTokenInput, bool) {
 	var parent *identity.MCPToken
 	if dispatch, ok := authctx.GetMCPDispatch(c.Request.Context()); ok {
 		var err error
-		parent, _, err = h.tokens.AuthorizeID(c.Request.Context(), dispatch.TokenID)
+		parent, _, err = h.tokens.AuthorizeReference(c.Request.Context(), dispatch.Source, dispatch.TokenID, dispatch.Credential)
 		if err != nil {
 			httpx.ErrorFrom(c, err)
 			return input, false
@@ -320,7 +323,7 @@ func (h *Handler) revokeToken(c *gin.Context) {
 func (h *Handler) listOperations(c *gin.Context) {
 	operations := h.catalog.Operations()
 	if dispatch, ok := authctx.GetMCPDispatch(c.Request.Context()); ok {
-		token, _, err := h.tokens.AuthorizeID(c.Request.Context(), dispatch.TokenID)
+		token, _, err := h.tokens.AuthorizeReference(c.Request.Context(), dispatch.Source, dispatch.TokenID, dispatch.Credential)
 		if err != nil {
 			httpx.ErrorFrom(c, err)
 			return
@@ -367,11 +370,11 @@ func (h *Handler) ownedApproval(c *gin.Context) (*control.Approval, *adminapi.Op
 	}
 	// An administrator can own several delegated credentials. Restrict SDK reads
 	// to the originating token so another agent cannot inspect its pending parameters.
-	if dispatch, internal := authctx.GetMCPDispatch(c.Request.Context()); internal && dispatch.TokenID != approval.TokenID {
+	if dispatch, internal := authctx.GetMCPDispatch(c.Request.Context()); internal && (dispatch.Source != approval.Source || dispatch.TokenID != approval.TokenID) {
 		httpx.NotFound(c, "Confirmation is unavailable")
 		return nil, nil, false
 	}
-	token, _, err := h.tokens.AuthorizeID(c.Request.Context(), approval.TokenID)
+	token, _, err := h.tokens.AuthorizeReference(c.Request.Context(), approval.Source, approval.TokenID, "")
 	op, exists := h.catalog.Get(approval.OperationID)
 	if err != nil || !exists || !token.Allows(approval.OperationID) || token.UpdatedAt.UTC().Format(time.RFC3339Nano) != approval.TokenVersion {
 		httpx.Error(c, http.StatusForbidden, "Token grants changed or were revoked")
@@ -392,7 +395,7 @@ func (h *Handler) getConfirmation(c *gin.Context) {
 	if !ok {
 		return
 	}
-	httpx.Success(c, gin.H{"id": approval.ID, "token_id": approval.TokenID, "operation": op, "preview": approval.Preview, "state": approval.State, "expires_at": approval.ExpiresAt})
+	httpx.Success(c, gin.H{"id": approval.ID, "token_id": approval.TokenID, "source": approval.Source, "operation": op, "preview": approval.Preview, "state": approval.State, "expires_at": approval.ExpiresAt})
 }
 
 // approveConfirmation validates the owner's browser and records its current session.
@@ -424,12 +427,23 @@ func (h *Handler) uploadFile(c *gin.Context) {
 		httpx.BadRequest(c, "Invalid file upload")
 		return
 	}
-	token, _, err := h.tokens.AuthorizeID(c.Request.Context(), input.TokenID)
+	if dispatch, internal := authctx.GetMCPDispatch(c.Request.Context()); internal {
+		if input.TokenID != 0 && input.TokenID != dispatch.TokenID || input.Source != "" && input.Source != dispatch.Source {
+			httpx.Error(c, http.StatusForbidden, "Upload must use the calling authorization")
+			return
+		}
+		input.TokenID = dispatch.TokenID
+		input.Source = dispatch.Source
+	} else if input.TokenID <= 0 {
+		httpx.BadRequest(c, "Browser uploads require a token or application identifier")
+		return
+	}
+	token, _, err := h.tokens.AuthorizeReference(c.Request.Context(), input.Source, input.TokenID, "")
 	if err != nil || token.UserID != administrator(c) || !token.Allows(input.OperationID) {
 		httpx.Error(c, http.StatusForbidden, "Token or operation is not available")
 		return
 	}
-	if dispatch, ok := authctx.GetMCPDispatch(c.Request.Context()); ok && dispatch.TokenID != token.ID {
+	if dispatch, ok := authctx.GetMCPDispatch(c.Request.Context()); ok && (dispatch.Source != token.Source || dispatch.TokenID != token.ID) {
 		httpx.Error(c, http.StatusForbidden, "Upload must use the calling token")
 		return
 	}
@@ -468,7 +482,7 @@ func (h *Handler) downloadFile(c *gin.Context) {
 		httpx.NotFound(c, "File is unavailable")
 		return
 	}
-	token, _, err := h.tokens.AuthorizeID(c.Request.Context(), file.TokenID)
+	token, _, err := h.tokens.AuthorizeReference(c.Request.Context(), file.Source, file.TokenID, "")
 	if err != nil || !token.Allows(file.OperationID) {
 		httpx.Error(c, http.StatusForbidden, "Token grants changed or were revoked")
 		return
@@ -499,6 +513,7 @@ func (h *Handler) downloadFile(c *gin.Context) {
 // The shared audit middleware retains the actual JWT authentication method while
 // making approvals and downloads searchable alongside that token's MCP executions.
 func traceRelatedToken(c *gin.Context, token *identity.MCPToken, operation string) {
+	c.Set("mcp_related_source", token.Source)
 	c.Set("mcp_related_token_id", token.ID)
 	c.Set("mcp_related_operation_id", operation)
 	c.Set("mcp_related_token_prefix", token.Prefix)

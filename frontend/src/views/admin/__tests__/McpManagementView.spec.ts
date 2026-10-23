@@ -10,6 +10,10 @@ import McpManagementView from '../McpManagementView.vue'
 // Shared API replacements allow each case to select its write and readback outcomes.
 const api = vi.hoisted(() => ({
   listTokens: vi.fn(),
+  listOAuthGrants: vi.fn(),
+  getOAuthStatus: vi.fn(),
+  updateOAuthGrant: vi.fn(),
+  revokeOAuthGrant: vi.fn(),
   listOperations: vi.fn(),
   createToken: vi.fn(),
   updateToken: vi.fn(),
@@ -130,6 +134,8 @@ describe('MCP token management', () => {
     route.query = {}
     copyToClipboard.mockResolvedValue(true)
     api.listTokens.mockResolvedValue([])
+    api.listOAuthGrants.mockResolvedValue([])
+    api.getOAuthStatus.mockResolvedValue({ enabled: false, issuer: '', resource: '' })
     api.listOperations.mockResolvedValue(catalogue)
   })
 
@@ -478,4 +484,47 @@ describe('MCP token management', () => {
     expect(saveAs).toHaveBeenCalledWith(blob, 'backup.sql.gz')
     wrapper.unmount()
   })
+})
+
+// Applications and manual tokens can share a numeric ID. Editing an application
+// must use its OAuth endpoint and observed version, while retaining the manual row.
+it('edits an application through its independent authorization endpoint', async () => {
+  const grant = {
+    id: 1,
+    user_id: 1,
+    source: 'oauth',
+    name: 'ChatGPT',
+    prefix: 'oauth:1',
+    client_id: 'https://chatgpt.com/oauth/client.json',
+    client_name: 'ChatGPT',
+    permissions: ['groups.list'],
+    enabled: true,
+    skip_browser_confirmation: false,
+    expires_at: null,
+    last_used_at: null,
+    created_at: '2026-10-23T00:00:00Z',
+    updated_at: '2026-10-23T00:00:00Z',
+    revoked_at: null,
+  }
+  api.listTokens.mockResolvedValue([{ ...grant, source: '', name: 'Manual token' }])
+  api.listOAuthGrants.mockResolvedValue([grant])
+  api.listOperations.mockResolvedValue(catalogue)
+  api.getOAuthStatus.mockResolvedValue({
+    enabled: true,
+    issuer: 'https://gateway.example',
+    resource: 'https://gateway.example/mcp',
+  })
+  api.updateOAuthGrant.mockResolvedValue(grant)
+  const wrapper = page()
+  await flushPromises()
+  await clickText(wrapper, 'admin.mcp.oauth.applications')
+  await clickText(wrapper, 'common.edit')
+  await wrapper.get('input[required]').setValue('My application')
+  await wrapper.get('form').trigger('submit')
+  await flushPromises()
+  expect(api.updateOAuthGrant).toHaveBeenCalledWith(
+    1,
+    expect.objectContaining({ name: 'My application', expected_updated_at: grant.updated_at }),
+  )
+  wrapper.unmount()
 })

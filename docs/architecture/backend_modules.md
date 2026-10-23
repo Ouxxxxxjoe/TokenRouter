@@ -439,4 +439,4 @@ app/lifecycle 管理这些组件的启动和关闭。audit 独立记录操作审
 | idempotency | [面板命令幂等](../interfaces/http_api.md#write_idempotency) |
 | infra、pkg、testutil、cmd、ent、migrations、tests、scripts | [系统架构](system_architecture.md)、[开发验证](../operations/development_workflow.md)、[部署迁移](../operations/deployment_and_migrations.md) |
 
-MCP 管理通过 `server/adminapi` 共享操作目录，并在既有 HTTP 管理链上执行。专用凭据归 identity，临时确认和文件归 mcp；接入与授权规则见 [MCP 管理接口](../interfaces/mcp_management.md)。
+MCP 管理通过 `server/adminapi` 共享操作目录，并在既有 HTTP 管理链上执行。专用凭据和 OAuth 应用授权归 identity，OAuth 协议适配与 CIMD 读取位于 identity/provider，临时确认和文件归 mcp；接入与授权规则见 [MCP 管理接口](../interfaces/mcp_management.md)。

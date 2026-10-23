@@ -22,6 +22,7 @@ export interface MCPOperation {
 
 // MCPToken contains administrator-visible metadata for a dedicated access credential.
 export interface MCPToken {
+  source?: string // Empty denotes manual credentials.
   id: number // Stored credential identifier.
   user_id: number // Owning administrator identifier.
   name: string // Administrator-chosen token label.
@@ -179,4 +180,81 @@ export async function downloadFile(id: string): Promise<MCPDownload> {
 export async function downloadSpecification(): Promise<Blob> {
   const { data } = await apiClient.get<Blob>('/admin/mcp/openapi', { responseType: 'blob' })
   return data
+}
+
+// MCPOAuthGrant describes one application's stable permissions and latest connection lifetime.
+export interface MCPOAuthGrant extends MCPToken {
+  client_id: string // Exact registered application identifier.
+  client_name: string // Consented application display name.
+  resource: string // Canonical authorized MCP resource.
+  connection_expires_at: string | null // Latest active credential expiry.
+}
+
+// MCPOAuthStatus supplies configured discovery availability without any signing credentials.
+export interface MCPOAuthStatus {
+  enabled: boolean // OAuth endpoint availability flag.
+  issuer: string // Configured public issuer origin.
+  resource: string // Canonical protected MCP URL.
+}
+
+// MCPOAuthReview supplies the browser's request details and session-bound approval proof.
+export interface MCPOAuthReview {
+  request: {
+    id: string // Opaque pending request identifier.
+    client: {
+      client_id: string // Exact requested client identifier.
+      client_name: string // Untrusted application display name.
+    }
+    expires_at: string // Absolute authorization request deadline.
+  }
+  nonce: string // Session-bound decision verification proof.
+  grant: MCPOAuthGrant | null // Previous live application authorization.
+  operations: MCPOperation[] // Mounted selectable operation catalogue.
+  redirect_uri: string // Server-validated client callback address.
+}
+
+// getOAuthStatus reads the configured OAuth availability for administrator connection guidance.
+export async function getOAuthStatus(signal?: AbortSignal): Promise<MCPOAuthStatus> {
+  const { data } = await apiClient.get<MCPOAuthStatus>('/admin/mcp/oauth/status', { signal })
+  return data
+}
+
+// listOAuthGrants reads this administrator's application grants including revoked history.
+export async function listOAuthGrants(signal?: AbortSignal): Promise<MCPOAuthGrant[]> {
+  const { data } = await apiClient.get<MCPOAuthGrant[]>('/admin/mcp/oauth/grants', { signal })
+  return data
+}
+
+// updateOAuthGrant conditionally replaces an application's permissions and confirmation policy.
+export async function updateOAuthGrant(id: number, input: MCPTokenInput): Promise<MCPOAuthGrant> {
+  const { data } = await apiClient.put<MCPOAuthGrant>(`/admin/mcp/oauth/grants/${id}`, input)
+  return data
+}
+
+// revokeOAuthGrant permanently revokes an owned application and all its credential families.
+export async function revokeOAuthGrant(id: number): Promise<void> {
+  await apiClient.delete(`/admin/mcp/oauth/grants/${id}`)
+}
+
+// getOAuthReview binds the authorization request to the current browser session.
+export async function getOAuthReview(id: string, signal?: AbortSignal): Promise<MCPOAuthReview> {
+  const { data } = await apiClient.get<MCPOAuthReview>(
+    `/admin/mcp/oauth/requests/${encodeURIComponent(id)}`,
+    { signal },
+  )
+  return data
+}
+
+// decideOAuthRequest consumes browser consent and returns the server-validated callback URL.
+export async function decideOAuthRequest(
+  id: string,
+  nonce: string,
+  approve: boolean,
+  permissions: string[],
+): Promise<string> {
+  const { data } = await apiClient.post<{ redirect_uri: string }>(
+    `/admin/mcp/oauth/requests/${encodeURIComponent(id)}/decision`,
+    { nonce, approve, permissions },
+  )
+  return data.redirect_uri
 }

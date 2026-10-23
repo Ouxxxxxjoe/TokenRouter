@@ -518,6 +518,7 @@ func shouldBypassEmbeddedFrontend(request *http.Request) bool {
 	}
 
 	return strings.HasPrefix(trimmed, "/api/") ||
+		strings.HasPrefix(trimmed, "/.well-known/oauth-") ||
 		trimmed == "/mcp" ||
 		strings.HasPrefix(trimmed, "/mcp/") ||
 		strings.HasPrefix(trimmed, "/v1/") ||

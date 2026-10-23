@@ -42,7 +42,7 @@ github.com/stretchr/testify/assert github.com/stripe/stripe-go/v85`},
 		"http": {Production: `github.com/modelcontextprotocol/go-sdk/mcp github.com/google/jsonschema-go/jsonschema github.com/coder/websocket github.com/gin-gonic/gin github.com/gin-gonic/gin/binding
 github.com/google/uuid github.com/google/wire github.com/gorilla/websocket
 github.com/klauspost/compress/zstd github.com/tidwall/gjson github.com/tidwall/sjson go.uber.org/zap
-golang.org/x/net/http/httpguts golang.org/x/net/http2 golang.org/x/sync/singleflight`, Tests: `github.com/alicebob/miniredis/v2 github.com/redis/go-redis/v9 github.com/cespare/xxhash/v2 github.com/imroc/req/v3 github.com/stretchr/testify/assert
+golang.org/x/net/http/httpguts golang.org/x/net/http2 golang.org/x/sync/singleflight`, Tests: `github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex golang.org/x/oauth2 github.com/alicebob/miniredis/v2 github.com/redis/go-redis/v9 github.com/cespare/xxhash/v2 github.com/imroc/req/v3 github.com/stretchr/testify/assert
 github.com/stretchr/testify/require go.uber.org/zap/zaptest/observer`},
 		"infra": {Production: `github.com/tidwall/gjson github.com/andybalholm/brotli github.com/imroc/req/v3 github.com/klauspost/compress/zstd
 github.com/lib/pq github.com/redis/go-redis/v9 github.com/refraction-networking/utls
@@ -56,7 +56,8 @@ github.com/patrickmn/go-cache golang.org/x/sync/errgroup`, Tests: `github.com/DA
 github.com/stretchr/testify/require github.com/stretchr/testify/suite
 github.com/testcontainers/testcontainers-go/modules/postgres
 github.com/testcontainers/testcontainers-go/modules/redis modernc.org/sqlite`},
-		"provider": {Production: `github.com/alibabacloud-go/captcha-20230305/client
+		"provider": {Production: `golang.org/x/crypto/bcrypt github.com/ory/fosite github.com/ory/fosite/compose
+github.com/alibabacloud-go/captcha-20230305/client
 github.com/alibabacloud-go/darabonba-openapi/v2/utils github.com/alibabacloud-go/tea/dara
 github.com/alibabacloud-go/tea/tea github.com/aws/aws-sdk-go-v2/aws
 github.com/aws/aws-sdk-go-v2/aws/signer/v4 github.com/aws/aws-sdk-go-v2/config
@@ -103,8 +104,8 @@ github.com/stretchr/testify/suite`},
 	}
 
 	moduleDependencies = map[string]dependencySet{
-		"internal/mcp": {Production: `internal/mcp/... internal/identity internal/identity/httpapi internal/identity/httpapi/authctx
-internal/audit internal/server/adminapi internal/server/httpx`, Tests: `internal/infra/crypto internal/testutil/postgrescontainer migrations`},
+		"internal/mcp": {Production: `internal/mcp/... internal/identity internal/identity/provider internal/identity/httpapi internal/identity/httpapi/authctx
+internal/audit internal/server/adminapi internal/server/httpx`, Tests: `internal/identity/postgres internal/infra/crypto internal/testutil/postgrescontainer migrations`},
 		"internal/requestlog": {Production: `internal/requestlog/... internal/infra/telemetry/... internal/identity/httpapi/authctx internal/server/httpx`, Tests: `internal/testutil/postgrescontainer migrations`},
 		"internal/modelcatalog": {Production: `internal/pkg/locale internal/modelcatalog internal/modelcatalog/provider internal/billing/pricing
 internal/egress internal/infra/httpclient/... internal/infra/telemetry/...`, Tests: `internal/billing internal/billing/provider
@@ -395,6 +396,7 @@ internal/upstream/zhipu/...`, Tests: ""},
 	}
 
 	ioFileExceptions = map[string]string{
+		"internal/mcp/httpapi/oauth_integration_test.go":     "database/sql",
 		"internal/provider/health_spark.go":                  "net/http",
 		"internal/backup/backup_external_test.go":            "database/sql",
 		"internal/gateway/httpapi/live_test.go":              "database/sql",
@@ -405,6 +407,10 @@ internal/upstream/zhipu/...`, Tests: ""},
 
 	// 窄权限属于指定文件，不能由相邻文件或目标子包继承。
 	filePermissions = []filePermission{
+		// OAuth registration hashes confidential-client secrets in its protocol adapter.
+		{Scope: "internal/identity/provider", Imports: "golang.org/x/crypto/bcrypt", Files: "mcp_oauth_clients.go"},
+		// Protocol acceptance uses the official OAuth client against migrated PostgreSQL.
+		{Scope: "internal/mcp/httpapi", Imports: "database/sql github.com/modelcontextprotocol/go-sdk/auth github.com/modelcontextprotocol/go-sdk/oauthex internal/identity/postgres golang.org/x/oauth2", Files: "oauth_integration_test.go"},
 		// Creative's OpenAI adapter uses the shared native Images reader for mode
 		// conversion; adjacent creative files retain their existing dependency limits.
 		{Scope: "internal/creative", Imports: "internal/upstream/openai", Files: "provider/openai.go"},

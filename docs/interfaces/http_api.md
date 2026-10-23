@@ -392,3 +392,7 @@ Grok 请求缓存开关使用 `X-TokenRouter-Grok-Client-Tool-Cache`，没有新
 ## SystemOne
 
 `POST /v1/systemone` 使用网关 API Key 认证，支持普通 Key 和复合 Key。分组开放 `systemone` 后，调度到已启用该协议的 Jev API Key 提供商。请求字段、成功响应和用量异常处理见 [Jev 与 SystemOne](jev_upstream.md)。
+
+## MCP OAuth 接入
+
+`/mcp` 同时接受专用 Token 和 OAuth access token。OAuth 公开发现与协议端点使用标准响应，浏览器授权和应用管理位于 `/api/v1/admin/mcp/oauth`，要求管理员 JWT。端点清单、授权期限和刷新规则见 [MCP OAuth 应用授权](mcp_management.md#oauth_authorization)。

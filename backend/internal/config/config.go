@@ -113,6 +113,8 @@ type RequestLogConfig struct {
 // application construction. Load normalizes and validates these values, while
 // the forwarded-IP accessors separately publish copied live policy snapshots.
 type Config struct {
+	MCP MCPConfig `mapstructure:"mcp"` // MCP authorization server settings
+
 	// request summary retention settings
 	RequestLog RequestLogConfig `mapstructure:"request_log"`
 	// HTTP ingress and listener settings
@@ -2444,6 +2446,7 @@ func setDefaults() {
 	viper.SetDefault("server.mode", "release")
 	viper.SetDefault("server.enable_server_timing", false)
 	viper.SetDefault("server.frontend_url", "")
+	viper.SetDefault("mcp.oauth.issuer_url", "")
 	viper.SetDefault("server.read_header_timeout", 10) // 10-second header read timeout.
 	viper.SetDefault("server.max_header_bytes", 64*1024)
 	viper.SetDefault("server.idle_timeout", 120) // 120-second idle timeout.
@@ -3095,6 +3098,9 @@ func setEnvReachableDefaults() {
 // scaling thresholds. This is the startup rule set; downstream runtime settings
 // and subsystem defaults remain their owners' responsibility.
 func (c *Config) Validate() error {
+	if err := c.MCP.Validate(); err != nil {
+		return err
+	}
 	if c.RequestLog.RetentionDays < 0 {
 		return fmt.Errorf("request_log.retention_days must be non-negative")
 	}

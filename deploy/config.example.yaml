@@ -1134,3 +1134,8 @@ update:
 # 请求摘要独立于 Ops 采样保存，通过内存缓冲批量写入数据库。
 request_log:
   retention_days: 30
+
+# MCP application authorization. Use the public server origin, without a path.
+mcp:
+  oauth:
+    issuer_url: "" # Empty disables OAuth; loopback HTTP is allowed for local development.

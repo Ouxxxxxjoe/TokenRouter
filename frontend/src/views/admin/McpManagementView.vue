@@ -70,14 +70,30 @@
       </template>
       <template #filters>
         <div class="flex flex-col gap-2">
+          <div class="tabs self-start" role="group" :aria-label="t('admin.mcp.title')">
+            <button
+              v-for="tab in ['tokens', 'applications']"
+              :key="tab"
+              type="button"
+              class="tab"
+              :class="{ 'tab-active': activeTab === tab }"
+              :aria-pressed="activeTab === tab"
+              @click="activeTab = tab"
+              >{{ t(`admin.mcp.oauth.${tab}`) }}</button
+            >
+          </div>
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="input-icon-wrap w-full sm:w-72">
               <Icon name="search" size="md" class="input-icon text-gray-400" />
               <input
                 v-model="search"
                 class="input input-has-icon"
-                :placeholder="t('admin.mcp.search')"
-                :aria-label="t('admin.mcp.search')"
+                :placeholder="
+                  t(activeTab === 'applications' ? 'admin.mcp.oauth.search' : 'admin.mcp.search')
+                "
+                :aria-label="
+                  t(activeTab === 'applications' ? 'admin.mcp.oauth.search' : 'admin.mcp.search')
+                "
               />
             </div>
             <div class="ml-auto flex gap-2">
@@ -94,6 +110,7 @@
                 <Icon name="link" size="sm" class="mr-2" />{{ t('admin.mcp.connection') }}
               </button>
               <button
+                v-if="activeTab === 'tokens'"
                 class="btn btn-primary"
                 type="button"
                 :disabled="loading || !operations.length"
@@ -113,7 +130,9 @@
       </template>
       <template #table>
         <DataTable
-          column-order-storage-key="admin-mcp-column-order"
+          :column-order-storage-key="
+            activeTab === 'applications' ? 'admin-mcp-oauth-column-order' : 'admin-mcp-column-order'
+          "
           :columns="columns"
           :data="visibleTokens"
           :loading="loading"
@@ -124,9 +143,14 @@
           </template>
           <template #cell-prefix="{ value, row }">
             <div class="flex items-center gap-2">
-              <code class="code text-xs">{{ value }}…</code>
+              <span
+                v-if="row.source === 'oauth'"
+                class="max-w-64 break-all text-xs text-gray-500 dark:text-gray-400"
+                >{{ row.client_id }}</span
+              >
+              <code v-else class="code text-xs">{{ value }}…</code>
               <button
-                v-if="!row.revoked_at"
+                v-if="!row.revoked_at && row.source !== 'oauth'"
                 type="button"
                 class="rounded-compact p-1 transition-colors"
                 :class="
@@ -179,6 +203,13 @@
               formatTime(value, t('admin.mcp.never'))
             }}</span></template
           >
+          <template #cell-connection_expires_at="{ value }"
+            ><span class="whitespace-nowrap tabular-nums">{{
+              value && Date.parse(value) > Date.now()
+                ? formatTime(value, '')
+                : t('admin.mcp.oauth.reconnect')
+            }}</span></template
+          >
           <template #cell-last_used_at="{ value }"
             ><span class="whitespace-nowrap tabular-nums">{{
               formatTime(value, t('admin.mcp.unused'))
@@ -189,8 +220,8 @@
               <button
                 v-if="!row.revoked_at"
                 type="button"
-                :disabled="busyTokens.has(row.id)"
-                class="flex flex-col items-center gap-0.5 rounded-control p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-dark-700 dark:hover:text-primary-400"
+                :disabled="busyTokens.has(tokenKey(row))"
+                class="flex flex-col items-center gap-0.5 rounded-control p-1.5 text-gray-500 dark:text-dark-300 transition-colors hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-dark-700 dark:hover:text-primary-400"
                 @click="openEditor(row)"
                 ><Icon name="edit" size="sm" /><span class="text-xs">{{
                   t('common.edit')
@@ -199,7 +230,7 @@
               <button
                 v-if="!row.revoked_at && !isExpired(row)"
                 type="button"
-                :disabled="busyTokens.has(row.id)"
+                :disabled="busyTokens.has(tokenKey(row))"
                 :class="[
                   'flex flex-col items-center gap-0.5 rounded-control p-1.5 transition-colors',
                   row.enabled
@@ -216,16 +247,18 @@
               </button>
               <button
                 type="button"
-                class="flex flex-col items-center gap-0.5 rounded-control p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:hover:bg-dark-700 dark:hover:text-white"
+                class="flex flex-col items-center gap-0.5 rounded-control p-1.5 text-gray-500 dark:text-dark-300 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:hover:bg-dark-700 dark:hover:text-white"
                 :class="{
                   'bg-gray-100 text-gray-900 dark:bg-dark-700 dark:text-white':
-                    actionToken?.id === row.id,
+                    !!actionToken && tokenKey(actionToken) === tokenKey(row),
                 }"
                 aria-haspopup="menu"
-                :disabled="busyTokens.has(row.id)"
-                :aria-expanded="actionToken?.id === row.id"
+                :disabled="busyTokens.has(tokenKey(row))"
+                :aria-expanded="!!actionToken && tokenKey(actionToken) === tokenKey(row)"
                 :aria-controls="
-                  actionToken?.id === row.id ? `mcp-action-menu-${row.id}` : undefined
+                  !!actionToken && tokenKey(actionToken) === tokenKey(row)
+                    ? `mcp-action-menu-${row.id}`
+                    : undefined
                 "
                 @click="openActionMenu(row, $event)"
                 ><Icon name="more" size="sm" /><span class="text-xs">{{
@@ -238,10 +271,16 @@
             <div class="flex flex-col items-center gap-2 p-8 text-center">
               <Icon name="key" size="xl" class="text-gray-400" />
               <p class="font-medium text-gray-900 dark:text-gray-100">{{
-                search ? t('admin.mcp.noResults') : t('admin.mcp.empty')
+                search
+                  ? t('admin.mcp.noResults')
+                  : t(activeTab === 'applications' ? 'admin.mcp.oauth.empty' : 'admin.mcp.empty')
               }}</p>
               <p v-if="!search" class="max-w-sm text-sm text-gray-500 dark:text-gray-400">{{
-                t('admin.mcp.emptyHint')
+                t(
+                  activeTab === 'applications'
+                    ? 'admin.mcp.oauth.connectionHint'
+                    : 'admin.mcp.emptyHint',
+                )
               }}</p>
             </div>
           </template>
@@ -302,14 +341,24 @@
 
     <BaseDialog
       :show="editorOpen"
-      :title="t(editingID ? 'admin.mcp.edit' : 'admin.mcp.create')"
+      :title="
+        t(
+          editingSource === 'oauth'
+            ? 'admin.mcp.oauth.edit'
+            : editingID
+              ? 'admin.mcp.edit'
+              : 'admin.mcp.create',
+        )
+      "
       width="wide"
       @close="closeEditor"
     >
       <form id="mcp-token-form" class="space-y-5" @submit.prevent="save">
         <div class="grid gap-4 sm:grid-cols-2">
           <label class="block"
-            ><span class="input-label">{{ t('admin.mcp.name') }}</span
+            ><span class="input-label">{{
+              t(editingSource === 'oauth' ? 'admin.mcp.oauth.name' : 'admin.mcp.name')
+            }}</span
             ><input
               v-model.trim="form.name"
               class="input"
@@ -339,142 +388,13 @@
             :aria-label="t('admin.mcp.skipBrowserConfirmation')"
           />
         </div>
-        <div class="space-y-3">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h3 class="input-label mb-0">{{ t('admin.mcp.permissions') }}</h3>
-            <span class="text-xs text-gray-500 dark:text-dark-400" aria-live="polite">{{
-              t('admin.mcp.selected', { count: selected.size })
-            }}</span>
-          </div>
-          <p class="input-hint">{{ t('admin.mcp.permissionHint') }}</p>
-          <div>
-            <label class="input-label">{{ t('admin.mcp.preset') }}</label>
-            <Select
-              :model-value="selectedPreset"
-              :options="presetOptions"
-              :aria-label="t('admin.mcp.preset')"
-              @update:model-value="applyPreset"
-            />
-            <p class="input-hint">{{ t(`admin.mcp.presetHints.${selectedPreset}`) }}</p>
-          </div>
-          <p v-if="unknownPermissions" class="text-sm text-amber-700 dark:text-amber-400">{{
-            t('admin.mcp.unknownPermissions')
-          }}</p>
-          <button
-            type="button"
-            class="input-label mb-0 flex items-center gap-2"
-            :aria-expanded="permissionsExpanded"
-            @click="permissionsExpanded = !permissionsExpanded"
-          >
-            <Icon
-              name="chevronDown"
-              size="sm"
-              class="transition-transform duration-fast"
-              :class="permissionsExpanded ? 'rotate-180' : ''"
-            />
-            {{ t('admin.mcp.adjustPermissions') }}
-          </button>
-          <div v-if="permissionsExpanded" class="space-y-3">
-            <div class="grid gap-2 sm:grid-cols-2">
-              <input
-                v-model="permissionSearch"
-                class="input"
-                :placeholder="t('admin.mcp.permissionSearch')"
-                :aria-label="t('admin.mcp.permissionSearch')"
-              />
-              <Select
-                v-model="moduleFilter"
-                :options="moduleOptions"
-                :aria-label="t('admin.mcp.allModules')"
-              />
-            </div>
-            <label class="flex items-center gap-2 text-sm"
-              ><input v-model="selectedOnly" type="checkbox" class="checkbox" />{{
-                t('admin.mcp.selectedOnly')
-              }}</label
-            >
-            <div
-              class="max-h-80 overflow-y-auto rounded-surface border border-gray-200 dark:border-dark-700"
-            >
-              <section
-                v-for="group in permissionGroups"
-                :key="group.name"
-                class="border-b border-gray-100 last:border-0 dark:border-dark-800"
-              >
-                <div
-                  class="sticky top-0 z-10 flex items-center justify-between gap-3 bg-gray-50 px-4 py-2 dark:bg-dark-800"
-                >
-                  <h4 class="input-label mb-0">{{ moduleLabel(group.name) }}</h4>
-                  <button
-                    class="text-xs text-primary-800 hover:text-primary-900 dark:text-primary-400 dark:hover:text-primary-300"
-                    type="button"
-                    @click="selectGroup(group.items)"
-                    >{{
-                      t(
-                        group.items.every((op) => selected.has(op.operation_id))
-                          ? 'admin.mcp.clearVisible'
-                          : 'admin.mcp.selectVisible',
-                      )
-                    }}</button
-                  >
-                </div>
-                <div v-for="operation in group.items" :key="operation.operation_id">
-                  <label
-                    class="flex cursor-pointer items-start gap-3 px-4 py-3 transition-colors duration-fast hover:bg-gray-50 dark:hover:bg-dark-800/50"
-                  >
-                    <input
-                      :checked="selected.has(operation.operation_id)"
-                      class="checkbox mt-1"
-                      type="checkbox"
-                      @change="
-                        selectOperation(
-                          operation.operation_id,
-                          ($event.target as HTMLInputElement).checked,
-                        )
-                      "
-                    />
-                    <span class="min-w-0 flex-1">
-                      <span class="flex flex-wrap items-center justify-between gap-2 text-sm"
-                        ><span>{{ operationLabel(operation) }}</span
-                        ><span
-                          v-if="operation.sensitive"
-                          class="text-xs text-amber-700 dark:text-amber-400"
-                          >{{
-                            t(
-                              form.skipBrowserConfirmation
-                                ? 'admin.mcp.sensitiveOperation'
-                                : 'admin.mcp.sensitive',
-                            )
-                          }}</span
-                        ><span v-else class="text-xs text-gray-500 dark:text-gray-400">{{
-                          t(operation.read_only ? 'admin.mcp.read' : 'admin.mcp.write')
-                        }}</span></span
-                      >
-                      <span
-                        class="mt-1 block break-all font-mono text-xs text-gray-500 dark:text-gray-400"
-                        >{{ operation.operation_id }}</span
-                      >
-                    </span>
-                  </label>
-                  <details v-if="operation.sensitive" class="px-4 pb-3 text-sm">
-                    <summary class="cursor-pointer text-gray-600 dark:text-gray-400">{{
-                      t('admin.mcp.operationDetails')
-                    }}</summary>
-                    <p class="mt-2 whitespace-pre-wrap text-gray-600 dark:text-gray-400">{{
-                      operation.description
-                    }}</p>
-                  </details>
-                </div>
-              </section>
-              <p v-if="!permissionGroups.length" class="p-6 text-center text-sm text-gray-500">{{
-                t('admin.mcp.noResults')
-              }}</p>
-            </div>
-            <p v-if="!form.skipBrowserConfirmation" class="input-hint">{{
-              t('admin.mcp.sensitiveHint')
-            }}</p>
-          </div>
-        </div>
+        <McpPermissionPicker
+          :key="`${editingID}:${editorOpen}`"
+          v-model="selected"
+          :operations="operations"
+          :skip-browser-confirmation="form.skipBrowserConfirmation"
+          :unknown-permissions="unknownPermissions"
+        />
         <p v-if="formError" class="text-sm text-red-600 dark:text-red-400" role="alert">{{
           formError
         }}</p>
@@ -522,6 +442,18 @@
       :title="t('admin.mcp.connection')"
       @close="connectionOpen = false"
     >
+      <div class="mb-5 space-y-2">
+        <h3 class="font-medium">{{ t('admin.mcp.oauth.connectionTitle') }}</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400">{{
+          t(oauthStatus?.enabled ? 'admin.mcp.oauth.connectionHint' : 'admin.mcp.oauth.disabled')
+        }}</p>
+        <code
+          v-if="oauthStatus?.enabled"
+          class="block break-all rounded-control bg-gray-100 p-3 text-sm dark:bg-dark-800"
+          >{{ oauthStatus.resource }}</code
+        >
+      </div>
+      <h3 class="mb-2 font-medium">{{ t('admin.mcp.oauth.tokens') }}</h3>
       <pre
         class="overflow-auto whitespace-pre-wrap break-all rounded-surface bg-gray-100 p-4 text-sm dark:bg-dark-800"
         >{{ connectionText() }}</pre>
@@ -541,11 +473,18 @@
     </BaseDialog>
     <ConfirmDialog
       :show="!!revoking"
-      :title="t('admin.mcp.revoke')"
-      :message="t('admin.mcp.revokeMessage', { name: revoking?.name })"
+      :title="t(revoking?.source === 'oauth' ? 'admin.mcp.oauth.revoke' : 'admin.mcp.revoke')"
+      :message="
+        t(
+          revoking?.source === 'oauth'
+            ? 'admin.mcp.oauth.revokeMessage'
+            : 'admin.mcp.revokeMessage',
+          { name: revoking?.name },
+        )
+      "
       :confirm-text="t('admin.mcp.revoke')"
       danger
-      :loading="!!revoking && busyTokens.has(revoking.id)"
+      :loading="!!revoking && busyTokens.has(tokenKey(revoking))"
       @confirm="revoke"
       @cancel="revoking = null"
     />
@@ -566,7 +505,7 @@ import MotionTransition from '@/components/common/MotionTransition.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import DateTimePicker from '@/components/common/DateTimePicker.vue'
-import Select from '@/components/common/Select.vue'
+import McpPermissionPicker from './mcp/McpPermissionPicker.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import Icon from '@/components/icons/Icon.vue'
 import EndpointPopover from '@/components/keys/EndpointPopover.vue'
@@ -580,7 +519,6 @@ import { COPY_FEEDBACK_MS } from '@/constants/ui'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatDateTime } from '@/utils/format'
 import type { MCPToken, MCPTokenInput, MCPOperation, MCPConfirmation } from '@/api/admin/mcp'
-import { permissionPresets } from './mcp/permissions'
 
 // McpManagementView.vue manages administrator-owned agent credentials and reviews
 // incoming confirmation links. Permission choices come from the backend operation
@@ -595,7 +533,7 @@ import { permissionPresets } from './mcp/permissions'
 // Browser confirmation uses the existing TOTP flow and leaves the approved action for the agent to retry.
 
 // Shared UI services supply locale, browser-route state, feedback, and strong authentication.
-const { t, te, locale } = useI18n()
+const { t, locale } = useI18n()
 const route = useRoute()
 const app = useAppStore()
 const stepUp = useStepUp()
@@ -603,6 +541,10 @@ const { copyToClipboard } = useClipboard()
 
 // Page snapshots and pending flags remain local to this administrator view.
 const tokens = ref<MCPToken[]>([])
+const applications = ref<MCPToken[]>([])
+const activeTab = ref('tokens')
+const oauthStatus = ref<api.MCPOAuthStatus | null>(null)
+const editingSource = ref('')
 const operations = ref<MCPOperation[]>([])
 const confirmation = ref<MCPConfirmation | null>(null)
 const loading = ref(false)
@@ -617,7 +559,7 @@ const approving = ref(false)
 const downloading = ref(false)
 // Each token retains its own mutation lock until write and readback finish;
 // another row's completion cannot unlock this token or expose an obsolete editor snapshot.
-const busyTokens = ref(new Set<number>())
+const busyTokens = ref(new Set<string>())
 const editingVersion = ref<string | undefined>()
 // Copy feedback and menu state belong to this page; disposal releases timers and listeners.
 const copyingTokenID = ref<number | null>(null)
@@ -631,85 +573,44 @@ const unknownPermissions = ref(false)
 // The editor retains the saved admission flag while row actions control status; editing configuration must not re-enable a disabled token.
 const form = reactive({ name: '', expiry: '', enabled: true, skipBrowserConfirmation: false })
 const selected = ref(new Set<string>())
-// selectedPreset is an editor convenience; persisted grants always use selected operation IDs.
-const selectedPreset = ref('custom')
-// permissionsExpanded keeps manual controls available after a preset initializes the draft.
-const permissionsExpanded = ref(true)
-const permissionSearch = ref('')
-const moduleFilter = ref('')
-const selectedOnly = ref(false)
 let loadController: AbortController | null = null
 let disposed = false
 
-// endpoint uses the configured API origin so separate frontend hosts show the gateway address.
-const endpoint = buildGatewayUrl('/mcp')
+// endpoint prefers the configured OAuth resource so browser and client discovery show the same address.
+const endpoint = computed(() =>
+  oauthStatus.value?.enabled ? oauthStatus.value.resource : buildGatewayUrl('/mcp'),
+)
 const fileID = computed(() => (typeof route.query.file_id === 'string' ? route.query.file_id : ''))
 const visibleTokens = computed(() =>
-  tokens.value.filter((token) =>
+  (activeTab.value === 'applications' ? applications.value : tokens.value).filter((token) =>
     `${token.name} ${token.prefix}`.toLowerCase().includes(search.value.toLowerCase()),
   ),
 )
 const columns = computed<Column[]>(() => [
-  { key: 'name', label: t('admin.mcp.name') },
-  { key: 'prefix', label: t('admin.mcp.token') },
+  {
+    key: 'name',
+    label: t(activeTab.value === 'applications' ? 'admin.mcp.oauth.name' : 'admin.mcp.name'),
+  },
+  {
+    key: 'prefix',
+    label: t(activeTab.value === 'applications' ? 'admin.mcp.oauth.client' : 'admin.mcp.token'),
+  },
   { key: 'permissions', label: t('admin.mcp.permissions') },
   { key: 'enabled', label: t('common.status') },
-  { key: 'expires_at', label: t('admin.mcp.expires') },
+  {
+    key: 'expires_at',
+    label: t(
+      activeTab.value === 'applications'
+        ? 'admin.mcp.oauth.authorizationExpires'
+        : 'admin.mcp.expires',
+    ),
+  },
+  ...(activeTab.value === 'applications'
+    ? [{ key: 'connection_expires_at', label: t('admin.mcp.oauth.connectionExpires') }]
+    : []),
   { key: 'last_used_at', label: t('admin.mcp.lastUsed') },
   { key: 'actions', label: t('common.actions') },
 ])
-// presets expand the mounted catalogue only when the administrator chooses a preset.
-const presets = computed(() => permissionPresets(operations.value))
-const presetOptions = computed(() => [
-  { value: 'custom', label: t('admin.mcp.presets.custom') },
-  ...presets.value.map((preset) => ({
-    value: preset.id,
-    label: `${t(`admin.mcp.presets.${preset.id}`)} · ${t('admin.mcp.permissionCount', { count: preset.permissions.length })}`,
-  })),
-])
-
-// applyPreset replaces the complete permission draft with one current preset.
-// Search and module filters do not narrow this selection. Choosing custom keeps
-// the current grants available for manual adjustment instead of adding future permissions.
-function applyPreset(value: string | number | boolean | null) {
-  const id = String(value ?? 'custom')
-  selectedPreset.value = id
-  const preset = presets.value.find((item) => item.id === id)
-  if (preset) selected.value = new Set(preset.permissions)
-  permissionsExpanded.value = !preset
-}
-const moduleOptions = computed(() => [
-  { value: '', label: t('admin.mcp.allModules') },
-  ...[...new Set(operations.value.map((op) => op.module))]
-    .sort()
-    .map((module) => ({ value: module, label: moduleLabel(module) })),
-])
-
-// permissionGroups groups the visible matches without changing hidden selected grants.
-const permissionGroups = computed(() => {
-  const groups = new Map<string, MCPOperation[]>()
-  for (const operation of operations.value) {
-    if (moduleFilter.value && operation.module !== moduleFilter.value) continue
-    if (selectedOnly.value && !selected.value.has(operation.operation_id)) continue
-    if (
-      !`${operation.title} ${operation.title_zh ?? ''} ${operation.operation_id}`
-        .toLowerCase()
-        .includes(permissionSearch.value.toLowerCase())
-    )
-      continue
-    const items = groups.get(operation.module) ?? []
-    items.push(operation)
-    groups.set(operation.module, items)
-  }
-  return [...groups].map(([name, items]) => ({ name, items }))
-})
-
-// moduleLabel resolves catalogue grouping names through presentation-only translations.
-function moduleLabel(module: string): string {
-  const key = `admin.mcp.modules.${module}`
-  return te(key) ? t(key) : module
-}
-
 // operationLabel displays a translated action when the catalogue supplies one.
 function operationLabel(operation: MCPOperation): string {
   return locale.value.startsWith('zh') && operation.title_zh ? operation.title_zh : operation.title
@@ -743,12 +644,16 @@ async function load() {
   error.value = ''
   confirmation.value = null
   try {
-    const [rows, catalogue] = await Promise.all([
+    const [rows, catalogue, grants, oauth] = await Promise.all([
       api.listTokens(controller.signal),
       api.listOperations(controller.signal),
+      api.listOAuthGrants(controller.signal),
+      api.getOAuthStatus(controller.signal),
     ])
     if (controller.signal.aborted) return
     tokens.value = rows
+    applications.value = grants
+    oauthStatus.value = oauth
     operations.value = catalogue
     if (typeof route.query.confirmation_id === 'string') {
       const review = await api.getConfirmation(route.query.confirmation_id, controller.signal)
@@ -794,8 +699,8 @@ async function copyToken(token: MCPToken) {
 // floating-panel geometry. Reopening the same trigger dismisses its menu, and
 // revoked rows display only their audit action.
 function openActionMenu(token: MCPToken, event: MouseEvent) {
-  if (busyTokens.value.has(token.id)) return
-  if (actionToken.value?.id === token.id) return closeActionMenu()
+  if (busyTokens.value.has(tokenKey(token))) return
+  if (actionToken.value && tokenKey(actionToken.value) === tokenKey(token)) return closeActionMenu()
   const target = event.currentTarget as HTMLElement | null
   if (!target) return
   // Reserve space for both action rows and their divider so viewport placement keeps the complete menu accessible.
@@ -822,7 +727,7 @@ function closeActionMenu() {
 
 // requestRevoke transfers the chosen row to the existing destructive-action confirmation dialog.
 function requestRevoke() {
-  if (!actionToken.value || busyTokens.value.has(actionToken.value.id)) return
+  if (!actionToken.value || busyTokens.value.has(tokenKey(actionToken.value))) return
   revoking.value = actionToken.value
   closeActionMenu()
 }
@@ -831,6 +736,9 @@ function requestRevoke() {
 function handleMenuEscape(event: KeyboardEvent) {
   if (event.key === 'Escape') closeActionMenu()
 }
+
+// Switching lists dismisses row menus whose numeric identifiers may exist in both sources.
+watch(activeTab, closeActionMenu)
 
 // The Escape listener exists only while the teleported menu is visible and is removed again during disposal.
 watch(actionToken, (token) => {
@@ -848,7 +756,8 @@ function localDate(value: string): string {
 // Removed operation identifiers are omitted and reported in the form; selecting
 // a module later affects matching visible operations without expanding future grants.
 function openEditor(token?: MCPToken) {
-  if (token && busyTokens.value.has(token.id)) return
+  if (token && busyTokens.value.has(tokenKey(token))) return
+  editingSource.value = token?.source ?? ''
   editingVersion.value = token?.updated_at
   editingID.value = token?.id ?? null
   form.name = token?.name ?? ''
@@ -861,18 +770,7 @@ function openEditor(token?: MCPToken) {
     : localDate(new Date(Date.now() + 30 * 86400_000).toISOString())
   const known = new Set(operations.value.map((op) => op.operation_id))
   selected.value = new Set((token?.permissions ?? []).filter((id) => known.has(id)))
-  selectedPreset.value = selected.value.size
-    ? (presets.value.find(
-        (preset) =>
-          preset.permissions.length === selected.value.size &&
-          preset.permissions.every((id) => selected.value.has(id)),
-      )?.id ?? 'custom')
-    : 'custom'
-  permissionsExpanded.value = selectedPreset.value === 'custom'
   unknownPermissions.value = (token?.permissions.length ?? 0) !== selected.value.size
-  permissionSearch.value = ''
-  moduleFilter.value = ''
-  selectedOnly.value = false
   formError.value = ''
   editorOpen.value = true
 }
@@ -880,27 +778,6 @@ function openEditor(token?: MCPToken) {
 // closeEditor dismisses an idle draft while keeping in-flight secret creation visible.
 function closeEditor() {
   if (!saving.value) editorOpen.value = false
-}
-
-// selectOperation replaces the selected set so permission summaries update together.
-function selectOperation(id: string, checked: boolean) {
-  selectedPreset.value = 'custom'
-  const next = new Set(selected.value)
-  if (checked) next.add(id)
-  else next.delete(id)
-  selected.value = next
-}
-
-// selectGroup selects or clears exactly the currently displayed matching operations.
-function selectGroup(items: MCPOperation[]) {
-  selectedPreset.value = 'custom'
-  const checked = !items.every((op) => selected.value.has(op.operation_id))
-  const next = new Set(selected.value)
-  for (const operation of items) {
-    if (checked) next.add(operation.operation_id)
-    else next.delete(operation.operation_id)
-  }
-  selected.value = next
 }
 
 // save persists the editor draft with its observed configuration version, then
@@ -914,8 +791,10 @@ function selectGroup(items: MCPOperation[]) {
 // restore the creation credential into view state.
 async function save() {
   const tokenID = editingID.value
-  if (saving.value || (tokenID !== null && busyTokens.value.has(tokenID))) return
-  if (tokenID !== null) busyTokens.value.add(tokenID)
+  const source = editingSource.value
+  const busyKey = `${source}:${tokenID}`
+  if (saving.value || (tokenID !== null && busyTokens.value.has(busyKey))) return
+  if (tokenID !== null) busyTokens.value.add(busyKey)
   saving.value = true
   formError.value = ''
   try {
@@ -927,7 +806,11 @@ async function save() {
       expires_at: form.expiry ? new Date(form.expiry).toISOString() : null,
     }
     if (tokenID !== null)
-      await api.updateToken(tokenID, { ...input, expected_updated_at: editingVersion.value })
+      await stepUp.run(() =>
+        source === 'oauth'
+          ? api.updateOAuthGrant(tokenID, { ...input, expected_updated_at: editingVersion.value })
+          : api.updateToken(tokenID, { ...input, expected_updated_at: editingVersion.value }),
+      )
     else {
       const created = await api.createToken(input)
       if (!disposed) credential.value = created.credential
@@ -940,7 +823,7 @@ async function save() {
   } finally {
     // Release this token only after its own mutation and list readback settle;
     // other rows keep their independent locks during concurrent operations.
-    if (tokenID !== null) busyTokens.value.delete(tokenID)
+    if (tokenID !== null) busyTokens.value.delete(busyKey)
     saving.value = false
   }
 }
@@ -949,22 +832,24 @@ async function save() {
 // The current row remains unchanged on failure, and the subsequent readback
 // confirms the persistent state used by MCP authentication.
 async function toggleToken(token: MCPToken, enabled: boolean) {
-  if (busyTokens.value.has(token.id)) return
-  busyTokens.value.add(token.id)
+  if (busyTokens.value.has(tokenKey(token))) return
+  busyTokens.value.add(tokenKey(token))
   try {
-    await api.updateToken(token.id, {
-      name: token.name,
-      permissions: token.permissions,
-      enabled,
-      skip_browser_confirmation: token.skip_browser_confirmation,
-      expires_at: token.expires_at,
-      expected_updated_at: token.updated_at,
-    })
+    await stepUp.run(() =>
+      (token.source === 'oauth' ? api.updateOAuthGrant : api.updateToken)(token.id, {
+        name: token.name,
+        permissions: token.permissions,
+        enabled,
+        skip_browser_confirmation: token.skip_browser_confirmation,
+        expires_at: token.expires_at,
+        expected_updated_at: token.updated_at,
+      }),
+    )
     await load()
   } catch (err) {
     error.value = messageOf(err, t('admin.mcp.saveFailed'))
   } finally {
-    busyTokens.value.delete(token.id)
+    busyTokens.value.delete(tokenKey(token))
   }
 }
 
@@ -973,16 +858,18 @@ async function toggleToken(token: MCPToken, enabled: boolean) {
 // owner's list.
 async function revoke() {
   const token = revoking.value
-  if (!token || busyTokens.value.has(token.id)) return
-  busyTokens.value.add(token.id)
+  if (!token || busyTokens.value.has(tokenKey(token))) return
+  busyTokens.value.add(tokenKey(token))
   try {
-    await api.revokeToken(token.id)
+    await stepUp.run(() =>
+      (token.source === 'oauth' ? api.revokeOAuthGrant : api.revokeToken)(token.id),
+    )
     revoking.value = null
     await load()
   } catch (err) {
     error.value = messageOf(err, t('admin.mcp.requestFailed'))
   } finally {
-    busyTokens.value.delete(token.id)
+    busyTokens.value.delete(tokenKey(token))
   }
 }
 
@@ -1032,6 +919,11 @@ async function downloadSpec() {
   }
 }
 
+// tokenKey distinguishes equal manual-token and application identifiers in row mutation locks.
+function tokenKey(token: MCPToken): string {
+  return `${token.source ?? ''}:${token.id}`
+}
+
 // isExpired compares the saved expiry with the current browser clock.
 function isExpired(token: MCPToken): boolean {
   return !!token.expires_at && Date.parse(token.expires_at) <= Date.now()
@@ -1051,7 +943,11 @@ function formatTime(value: string | null, empty: string): string {
 
 // connectionText describes the remote endpoint and authentication header for client setup.
 function connectionText(secret = '<MCP_ACCESS_TOKEN>'): string {
-  return JSON.stringify({ url: endpoint, headers: { Authorization: `Bearer ${secret}` } }, null, 2)
+  return JSON.stringify(
+    { url: endpoint.value, headers: { Authorization: `Bearer ${secret}` } },
+    null,
+    2,
+  )
 }
 
 // clearCredential removes the only complete credential retained by this mounted page.

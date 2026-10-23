@@ -15,8 +15,9 @@ import (
 	postgresinfra "github.com/TokenFlux/TokenRouter/internal/infra/postgres"
 )
 
-// security_secret_bootstrap.go resolves and persists the JWT signing secret
-// shared by application instances.
+// security_secret_bootstrap.go resolves persisted JWT and MCP OAuth signing
+// secrets shared by application instances. OAuth uses an independent generated
+// value when its issuer is configured; browser JWT signing retains its own key.
 // Multiple application instances need the same persisted JWT signing value
 // even when their configured or generated candidates differ. Bootstrap trims
 // the configured value, inserts a candidate only when its key is absent, then
@@ -42,7 +43,7 @@ const (
 // test cases inject failures before restoring the process-wide function.
 var readRandomBytes = rand.Read
 
-// ensureBootstrapSecrets resolves the persisted JWT value and writes it into
+// ensureBootstrapSecrets resolves independent JWT and enabled OAuth keys into
 // cfg. Nil client or cfg returns an error, and cfg.JWT.Secret is trimmed
 // before lookup or persistence, so a later failure can leave that trimmed
 // value in cfg.
@@ -63,6 +64,15 @@ func ensureBootstrapSecrets(ctx context.Context, client *ent.Client, cfg *config
 		return fmt.Errorf("nil config")
 	}
 
+	if cfg.MCP.OAuth.IssuerURL != "" {
+		// Resolve the independent OAuth signing key before HTTP assembly so all
+		// instances verify the same opaque credentials across restarts and deployments.
+		value, _, err := getOrCreateGeneratedSecuritySecret(ctx, client, "mcp_oauth_secret", 32)
+		if err != nil {
+			return fmt.Errorf("ensure MCP OAuth secret: %w", err)
+		}
+		cfg.MCP.OAuth.SigningSecret = value
+	}
 	cfg.JWT.Secret = strings.TrimSpace(cfg.JWT.Secret)
 	if cfg.JWT.Secret != "" {
 		storedSecret, err := createSecuritySecretIfAbsent(ctx, client, securitySecretKeyJWT, cfg.JWT.Secret)
