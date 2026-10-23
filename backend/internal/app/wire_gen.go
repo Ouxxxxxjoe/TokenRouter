@@ -528,7 +528,7 @@ func initializeApplication(ctx context.Context, cfg *config.Config, info BuildIn
 	idempotencyCleanupService := provideIdempotencyCleanupService(idempotencyRepository, cfg)
 	appHttpRouteMount := provideHTTPRouteMount(appAuthRouteMount, appUserRouteMount, appAdminRouteMount, appGatewayRouteMount, appPaymentRouteMount, idempotencyCoordinator, idempotencyCleanupService)
 	jwtAuthMiddleware := provideJWTAuth(appIdentityAuthGraph, userService, runtimeSettings, auditLogService)
-	mcpoAuthServer, err := provideMCPOAuth(db, userService, cfg, manager)
+	mcpoAuthServer, err := provideMCPOAuth(db, userService, cfg, store, manager)
 	if err != nil {
 		return nil, err
 	}

@@ -166,13 +166,13 @@ func (h *Handler) serveMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Fields(r.Header.Get("Authorization"))
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		w.Header().Set("WWW-Authenticate", h.oauthChallenge(""))
+		w.Header().Set("WWW-Authenticate", h.oauthChallenge(r.Context(), ""))
 		http.Error(w, "MCP access token required", http.StatusUnauthorized)
 		return
 	}
 	token, _, err := h.tokens.Authenticate(r.Context(), parts[1])
 	if err != nil {
-		w.Header().Set("WWW-Authenticate", h.oauthChallenge("invalid_token"))
+		w.Header().Set("WWW-Authenticate", h.oauthChallenge(r.Context(), "invalid_token"))
 		http.Error(w, "MCP access token is invalid or expired", http.StatusUnauthorized)
 		return
 	}
@@ -331,11 +331,15 @@ func (h *Handler) checkBrowserStepUp(c *gin.Context) bool {
 // oauthChallenge advertises the configured discovery endpoint for unauthenticated clients.
 // Manual-only deployments retain the ordinary Bearer challenge. OAuth deployments
 // use a fixed resource URL and never derive discovery links from request headers.
-func (h *Handler) oauthChallenge(reason string) string {
-	if h.options.OAuth == nil || !h.options.OAuth.Enabled() {
+func (h *Handler) oauthChallenge(ctx context.Context, reason string) string {
+	if h.options.OAuth == nil {
 		return "Bearer"
 	}
-	challenge := "Bearer resource_metadata=" + strconv.Quote(h.options.OAuth.Issuer()+"/.well-known/oauth-protected-resource/mcp") + ", scope=\"mcp\""
+	server, err := h.options.OAuth.Current(ctx)
+	if err != nil {
+		return "Bearer"
+	}
+	challenge := "Bearer resource_metadata=" + strconv.Quote(server.Issuer()+"/.well-known/oauth-protected-resource/mcp") + ", scope=\"mcp\""
 	if reason != "" {
 		challenge += ", error=" + strconv.Quote(reason)
 	}

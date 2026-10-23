@@ -293,7 +293,7 @@ export default {
       frontendUrl: 'Frontend URL',
       frontendUrlPlaceholder: 'https://example.com',
       frontendUrlHint:
-        'Used to generate external links in emails, including password resets and team invitations. Example: https://example.com',
+        'Used for email links and MCP OAuth, for example https://example.com. Changing the site origin requires connected MCP applications to reconnect.',
       totp: 'Two-Factor Authentication (2FA)',
       totpHint: 'Allow users to use authenticator apps like Google Authenticator',
       totpKeyNotConfigured:

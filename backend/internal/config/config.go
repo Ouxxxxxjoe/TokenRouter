@@ -113,7 +113,7 @@ type RequestLogConfig struct {
 // application construction. Load normalizes and validates these values, while
 // the forwarded-IP accessors separately publish copied live policy snapshots.
 type Config struct {
-	MCP MCPConfig `mapstructure:"mcp"` // MCP authorization server settings
+	MCPOAuthSigningSecret string `mapstructure:"-" json:"-"` // Bootstrap-resolved hexadecimal OAuth signing key.
 
 	// request summary retention settings
 	RequestLog RequestLogConfig `mapstructure:"request_log"`
@@ -572,7 +572,7 @@ type ServerConfig struct {
 	// Gin debug or release mode
 	Mode               string `mapstructure:"mode"`
 	EnableServerTiming bool   `mapstructure:"enable_server_timing"` // Return Server-Timing for admin page requests.
-	FrontendURL        string `mapstructure:"frontend_url"`         // Frontend base URL used for external links in email.
+	FrontendURL        string `mapstructure:"frontend_url"`         // Default frontend address for email links and MCP OAuth.
 	ReadHeaderTimeout  int    `mapstructure:"read_header_timeout"`  // Request-header read timeout, in seconds.
 	MaxHeaderBytes     int    `mapstructure:"max_header_bytes"`     // Header size limit in bytes; maps to the HTTP/2 header-list limit.
 	IdleTimeout        int    `mapstructure:"idle_timeout"`         // Idle connection timeout, in seconds.
@@ -2446,7 +2446,6 @@ func setDefaults() {
 	viper.SetDefault("server.mode", "release")
 	viper.SetDefault("server.enable_server_timing", false)
 	viper.SetDefault("server.frontend_url", "")
-	viper.SetDefault("mcp.oauth.issuer_url", "")
 	viper.SetDefault("server.read_header_timeout", 10) // 10-second header read timeout.
 	viper.SetDefault("server.max_header_bytes", 64*1024)
 	viper.SetDefault("server.idle_timeout", 120) // 120-second idle timeout.
@@ -3098,9 +3097,6 @@ func setEnvReachableDefaults() {
 // scaling thresholds. This is the startup rule set; downstream runtime settings
 // and subsystem defaults remain their owners' responsibility.
 func (c *Config) Validate() error {
-	if err := c.MCP.Validate(); err != nil {
-		return err
-	}
 	if c.RequestLog.RetentionDays < 0 {
 		return fmt.Errorf("request_log.retention_days must be non-negative")
 	}

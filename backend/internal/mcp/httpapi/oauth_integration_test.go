@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,13 +43,21 @@ type oauthFixture struct {
 	repo        *postgres.MCPOAuthStore  // migrated OAuth fixture repository
 	*mcpFixture                          // existing tool and browser fixtures
 	db          *sql.DB                  // migrated PostgreSQL database connection
-	oauth       *provider.MCPOAuthServer // real OAuth protocol implementation
+	oauth       *provider.MCPOAuthServer // initial protocol instance for fixture assertions
+	config      *oauthSettingsFixture    // Mutable single-server site settings.
 	http        *httptest.Server         // canonical OAuth and MCP server
 	userID      int64                    // persisted administrator account identifier
 }
 
 // oauthLimiterFixture isolates protocol persistence tests from Redis admission limits.
 type oauthLimiterFixture struct{}
+
+// oauthSettingsFixture holds the single test server's editable site configuration.
+type oauthSettingsFixture struct {
+	mu    sync.RWMutex                   // Protects HTTP and test configuration access.
+	value provider.MCPOAuthConfiguration // Current public address and switch.
+	err   error                          // Injected configuration read failure.
+}
 
 // newOAuthFixture mounts OAuth beside the existing production MCP handler.
 // Each test owns an isolated migrated database. OAuth and manual grants both
@@ -64,7 +73,8 @@ func newOAuthFixture(t *testing.T) *oauthFixture {
 	server := httptest.NewUnstartedServer(router)
 	issuer := "http://" + server.Listener.Addr().String()
 	repo := postgres.NewMCPOAuthStore(db)
-	oauth := provider.NewMCPOAuthServer(repo, base.accounts, issuer, bytes.Repeat([]byte{7}, 32))
+	config := &oauthSettingsFixture{value: provider.MCPOAuthConfiguration{FrontendURL: issuer, Enabled: true}}
+	oauth := provider.NewMCPOAuthServer(repo, base.accounts, config, bytes.Repeat([]byte{7}, 32))
 	base.handler.options.OAuth = oauth
 	base.handler.options.Limiter = &oauthLimiterFixture{}
 	base.handler.tokens.SetOAuth(oauth)
@@ -80,7 +90,9 @@ func newOAuthFixture(t *testing.T) *oauthFixture {
 	}))
 	server.Start()
 	t.Cleanup(server.Close)
-	return &oauthFixture{mcpFixture: base, repo: repo, db: db, oauth: oauth, http: server, userID: id}
+	current, err := oauth.Current(t.Context())
+	require.NoError(t, err)
+	return &oauthFixture{config: config, mcpFixture: base, repo: repo, db: db, oauth: current, http: server, userID: id}
 }
 
 // register creates a public OAuth client through the actual dynamic registration endpoint.
@@ -510,4 +522,141 @@ func TestOAuthUploadUsesCurrentAuthorization(t *testing.T) {
 	response = f.browser(t, http.MethodGet, "/api/v1/admin/mcp/files/"+fileID, "browser")
 	require.Equal(t, 403, response.StatusCode)
 	require.NoError(t, response.Body.Close())
+}
+
+// Read copies site settings while excluding concurrent fixture updates.
+func (s *oauthSettingsFixture) Read(context.Context) (provider.MCPOAuthConfiguration, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.value, s.err
+}
+
+// SetEnabled updates the persisted-switch substitute for following HTTP requests.
+func (s *oauthSettingsFixture) SetEnabled(_ context.Context, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.value.Enabled = enabled
+	return nil
+}
+
+// setFrontend replaces the fixture address before subsequent OAuth requests arrive.
+func (s *oauthSettingsFixture) setFrontend(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.value.FrontendURL = value
+}
+
+// TestOAuthFrontendRuntimeChanges uses the production protocol before and after site edits.
+// Old access tokens, refresh credentials, codes, and browser requests must fail
+// under the new origin, while discovery publishes only the configured address.
+func TestOAuthFrontendRuntimeChanges(t *testing.T) {
+	f := newOAuthFixture(t)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+	require.Equal(t, http.StatusOK, status)
+	access := oauthString(t, pair, "access_token")
+	root := f.handler.options.OAuth
+	grant, err := root.Authenticate(t.Context(), access)
+	require.NoError(t, err)
+	otherClient := f.register(t)
+	oldCode, oldVerifier := f.code(t, otherClient)
+	metadata, err := f.repo.GetClient(t.Context(), clientID)
+	require.NoError(t, err)
+	pending := &identity.MCPOAuthPending{ID: "site-change-review", Client: *metadata, Form: url.Values{"resource": {f.oauth.Resource()}}, ExpiresAt: time.Now().Add(time.Minute)}
+	require.NoError(t, f.repo.PutPending(t.Context(), pending))
+	review, err := f.oauth.Review(t.Context(), pending.ID, f.userID, "fixture-session")
+	require.NoError(t, err)
+	f.config.setFrontend("https://new-site.example")
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, f.http.URL+"/.well-known/oauth-authorization-server", nil)
+	require.NoError(t, err)
+	request.Host = "attacker.example"
+	request.Header.Set("X-Forwarded-Host", "attacker.example")
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	var discovery map[string]any
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&discovery))
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, "https://new-site.example", discovery["issuer"])
+	_, err = root.Authenticate(t.Context(), access)
+	require.Error(t, err)
+	_, err = root.AuthorizeGrant(t.Context(), grant.ID)
+	require.Error(t, err)
+	status, _ = f.exchange(t, url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {oauthString(t, pair, "refresh_token")}})
+	require.Equal(t, http.StatusBadRequest, status)
+	status, _ = f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {otherClient}, "code": {oldCode}, "code_verifier": {oldVerifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {"https://new-site.example/mcp"}})
+	require.Equal(t, http.StatusBadRequest, status)
+	current, err := root.Current(t.Context())
+	require.NoError(t, err)
+	_, err = current.Review(t.Context(), pending.ID, f.userID, "fixture-session")
+	require.Error(t, err)
+	_, err = current.Decide(t.Context(), pending.ID, f.userID, "fixture-session", review.Nonce, true, []string{"fixture.get"})
+	require.Error(t, err)
+	// A fresh request at the new site must show the existing application grants
+	// for review, while the old credentials remain bound to their earlier resource.
+	fresh := &identity.MCPOAuthPending{ID: "new-site-review", Client: *metadata, Form: url.Values{"resource": {current.Resource()}}, ExpiresAt: time.Now().Add(time.Minute)}
+	require.NoError(t, f.repo.PutPending(t.Context(), fresh))
+	renewedReview, err := current.Review(t.Context(), fresh.ID, f.userID, "fixture-session")
+	require.NoError(t, err)
+	require.NotNil(t, renewedReview.Grant)
+	require.Equal(t, grant.ID, renewedReview.Grant.ID)
+	require.Equal(t, grant.Permissions, renewedReview.Grant.Permissions)
+}
+
+// TestOAuthAvailabilityChangesWithoutRestart edits the address and switch after mounting routes.
+// Protocol discovery becomes available as soon as a valid site address exists;
+// browser-only switch updates disable subsequent credential and stable-grant checks.
+func TestOAuthAvailabilityChangesWithoutRestart(t *testing.T) {
+	f := newOAuthFixture(t)
+	f.config.setFrontend("")
+	response, err := http.Get(f.http.URL + "/.well-known/oauth-authorization-server")
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	response = f.browser(t, http.MethodGet, "/api/v1/admin/mcp/oauth/status", "browser")
+	var state struct {
+		Data provider.MCPOAuthStatus `json:"data"` /* Browser status response. */
+	}
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&state))
+	require.NoError(t, response.Body.Close())
+	require.True(t, state.Data.Allowed)
+	require.False(t, state.Data.Enabled)
+	require.Equal(t, "frontend_url_missing", state.Data.Reason)
+	f.config.setFrontend(f.http.URL)
+	clientID := f.register(t)
+	code, verifier := f.code(t, clientID)
+	status, pair := f.exchange(t, url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {code}, "code_verifier": {verifier}, "redirect_uri": {"http://127.0.0.1:43111/callback"}, "resource": {f.oauth.Resource()}})
+	require.Equal(t, http.StatusOK, status)
+	access := oauthString(t, pair, "access_token")
+	root := f.handler.options.OAuth
+	grant, err := root.Authenticate(t.Context(), access)
+	require.NoError(t, err)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPut, f.http.URL+"/api/v1/admin/mcp/oauth/status", strings.NewReader(`{"enabled":false}`))
+	require.NoError(t, err)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer browser")
+	response, err = http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&state))
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.False(t, state.Data.Allowed)
+	require.Equal(t, "disabled", state.Data.Reason)
+	_, err = root.Authenticate(t.Context(), access)
+	require.Error(t, err)
+	_, err = root.AuthorizeGrant(t.Context(), grant.ID)
+	require.Error(t, err)
+	response = f.browser(t, http.MethodPut, "/api/v1/admin/mcp/oauth/status", access)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusUnauthorized, response.StatusCode)
+	f.config.mu.Lock()
+	f.config.err = errors.New("settings unavailable")
+	f.config.mu.Unlock()
+	response, err = http.Get(f.http.URL + "/.well-known/oauth-authorization-server")
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	_, err = root.Authenticate(t.Context(), access)
+	require.Error(t, err)
 }

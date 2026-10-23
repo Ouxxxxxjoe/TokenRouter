@@ -114,9 +114,11 @@
 
 ### MCP OAuth
 
-`mcp.oauth.issuer_url` 或 `MCP_OAUTH_ISSUER_URL` 配置 MCP OAuth 的公开授权服务器 origin。留空关闭 OAuth；配置值使用 HTTPS，不包含路径、查询、片段或用户信息，回环 HTTP 可用于本地开发。所有实例使用同一个 origin，公开 `/mcp` 的 resource 从它派生，`api_base_url` 的展示设置不替代 issuer。
+MCP OAuth 的公开地址使用现有 `frontend_url`，后台保存的非空值优先，部署 `server.frontend_url` 其次。仅接受不含路径、查询、片段或用户信息的 HTTPS origin，回环 HTTP 可用于本地开发。地址缺失或不适用时 OAuth 不可用，管理员可以在 MCP 接入配置中查看原因并前往原前端地址设置。`api_base_url` 继续用于客户端接入展示。
 
-OAuth 使用独立的持久签名密钥，启动时在 `security_secrets` 中生成或读取。`frontend_url` 决定授权页面及浏览器接续的前端地址；未配置时，OAuth 登录授权页面使用 issuer 所在站点。手工 MCP 令牌的固定 TOTP 加密密钥要求继续适用。具体端点、期限及客户端约束见 [MCP OAuth 应用授权](mcp_management.md#oauth_authorization)。
+数据库运行时设置 `mcp_oauth_enabled` 默认开启，由 MCP 接入配置的开关写入。修改开关或前端地址无需重启；每个请求读取当前值，数据库读取失败时拒绝 OAuth 访问。该设置不产生独立的地址副本。前端 origin 变化后，旧地址的 OAuth 连接需要重新授权。
+
+启动时始终在 `security_secrets` 中生成或读取独立 OAuth 签名密钥，以支持后续通过后台配置前端地址直接启用。授权页面同样使用已校验的前端 origin。手工 MCP 令牌的固定 TOTP 加密密钥要求继续适用。具体端点、期限及客户端约束见 [MCP OAuth 应用授权](mcp_management.md#oauth_authorization)。
 
 ## 首次初始化
 

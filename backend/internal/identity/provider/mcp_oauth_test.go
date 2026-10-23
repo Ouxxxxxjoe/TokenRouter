@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,16 +16,24 @@ import (
 // Malformed requests must return bounded OAuth errors locally without requiring
 // a parsed Fosite requester or allowing a callback supplied by rejected input.
 
+// oauthSettingsFixture provides mutable site settings for isolated protocol checks.
+type oauthSettingsFixture struct {
+	value MCPOAuthConfiguration // Current fixture configuration values.
+	err   error                 // Injected settings read failure.
+}
+
 // TestOAuthMalformedAuthorizationReturnsLocalError covers invalid encoding and
 // duplicate parameters before request parsing. Each response is an OAuth 400
 // without a redirect, and the error writer must not panic on an absent requester.
 func TestOAuthMalformedAuthorizationReturnsLocalError(t *testing.T) {
-	server := NewMCPOAuthServer(nil, nil, "https://gateway.example", bytes.Repeat([]byte{3}, 32))
+	root := NewMCPOAuthServer(nil, nil, &oauthSettingsFixture{value: MCPOAuthConfiguration{FrontendURL: "https://gateway.example", Enabled: true}}, bytes.Repeat([]byte{3}, 32))
+	server, err := root.Current(t.Context())
+	require.NoError(t, err)
 	for _, query := range []string{"client_id=a&client_id=b", "state=%zz", "state=" + strings.Repeat("x", 4097)} {
 		request := httptest.NewRequest(http.MethodGet, "https://gateway.example/mcp/oauth/authorize", nil)
 		request.URL.RawQuery = query
 		response := httptest.NewRecorder()
-		require.NotPanics(t, func() { server.Start(response, request, "") })
+		require.NotPanics(t, func() { server.Start(response, request) })
 		require.Equal(t, http.StatusBadRequest, response.Code)
 		require.Empty(t, response.Header().Get("Location"))
 		var result map[string]any
@@ -37,10 +46,23 @@ func TestOAuthMalformedAuthorizationReturnsLocalError(t *testing.T) {
 // oversized opaque values with no repository installed. Rejection must happen
 // before persistence is consulted, preserving the MCP credential format boundary.
 func TestOAuthForeignCredentialsFailBeforeStorage(t *testing.T) {
-	server := NewMCPOAuthServer(nil, nil, "https://gateway.example", bytes.Repeat([]byte{3}, 32))
+	root := NewMCPOAuthServer(nil, nil, &oauthSettingsFixture{value: MCPOAuthConfiguration{FrontendURL: "https://gateway.example", Enabled: true}}, bytes.Repeat([]byte{3}, 32))
+	server, err := root.Current(t.Context())
+	require.NoError(t, err)
 	for _, credential := range []string{"panel.jwt.signature", "refresh-token", "ory_at_" + strings.Repeat("x", 513)} {
 		var err error
 		require.NotPanics(t, func() { _, err = server.Authenticate(t.Context(), credential) })
 		require.Error(t, err)
 	}
+}
+
+// Read returns the fixture configuration or its injected storage failure.
+func (s *oauthSettingsFixture) Read(context.Context) (MCPOAuthConfiguration, error) {
+	return s.value, s.err
+}
+
+// SetEnabled stores the requested preference for subsequent fixture reads.
+func (s *oauthSettingsFixture) SetEnabled(_ context.Context, enabled bool) error {
+	s.value.Enabled = enabled
+	return nil
 }

@@ -8,7 +8,7 @@
 //   - passkey.go: WebAuthn registration and authentication verification.
 //
 // File groups:
-//   - mcp_oauth*.go: protocol service, client metadata, and Fosite persistence adapter.
+//   - mcp_oauth*.go: frontend-derived settings, protocol service, client metadata, and Fosite storage.
 //   - email_oauth.go, linuxdo_oauth.go, and wechat_oauth.go: external login exchanges.
 //   - oidc_oauth.go, settings_oidc_discovery.go, and google_one_tap.go: verified claims and discovery.
 //   - dingtalk*.go: enterprise identity and department queries.

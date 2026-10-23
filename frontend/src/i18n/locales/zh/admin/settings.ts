@@ -275,7 +275,8 @@ export default {
       passwordResetHint: '允许用户通过邮箱重置密码',
       frontendUrl: '前端地址',
       frontendUrlPlaceholder: 'https://example.com',
-      frontendUrlHint: '用于生成密码重置、团队邀请等邮件中的外部链接，例如 https://example.com',
+      frontendUrlHint:
+        '用于邮件链接和 MCP OAuth 接入，例如 https://example.com。修改站点地址后，已连接的 MCP 应用需要重新连接。',
       totp: '双因素认证 (2FA)',
       totpHint: '允许用户使用 Google Authenticator 等应用进行二次验证',
       totpKeyNotConfigured:

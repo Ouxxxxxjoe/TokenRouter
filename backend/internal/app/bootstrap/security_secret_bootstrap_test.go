@@ -432,17 +432,16 @@ func TestGenerateHexSecretLengths(t *testing.T) {
 	require.NotEqual(t, v1, v2)
 }
 
-// TestEnsureBootstrapSecretsOAuthPersistsIndependentKey starts two enabled instances
-// against the same database. Their OAuth key must match each other while staying
-// independent from the existing JWT signing value and surviving a later bootstrap.
+// TestEnsureBootstrapSecretsOAuthPersistsIndependentKey starts before any frontend URL exists.
+// The generated OAuth key must differ from the JWT secret and remain unchanged
+// when another bootstrap follows a backend restart.
 func TestEnsureBootstrapSecretsOAuthPersistsIndependentKey(t *testing.T) {
 	client := newSecuritySecretTestClient(t)
-	first := &config.Config{MCP: config.MCPConfig{OAuth: config.MCPOAuthConfig{IssuerURL: "https://gateway.example"}}}
+	first := &config.Config{}
 	require.NoError(t, ensureBootstrapSecrets(t.Context(), client, first))
-	require.Len(t, first.MCP.OAuth.SigningSecret, 64)
-	require.NotEqual(t, first.JWT.Secret, first.MCP.OAuth.SigningSecret)
-	second := &config.Config{MCP: first.MCP}
-	second.MCP.OAuth.SigningSecret = ""
+	require.Len(t, first.MCPOAuthSigningSecret, 64)
+	require.NotEqual(t, first.JWT.Secret, first.MCPOAuthSigningSecret)
+	second := &config.Config{}
 	require.NoError(t, ensureBootstrapSecrets(t.Context(), client, second))
-	require.Equal(t, first.MCP.OAuth.SigningSecret, second.MCP.OAuth.SigningSecret)
+	require.Equal(t, first.MCPOAuthSigningSecret, second.MCPOAuthSigningSecret)
 }

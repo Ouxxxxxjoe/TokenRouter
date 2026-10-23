@@ -27,8 +27,13 @@ export default {
       connectionTitle: 'Connect with OAuth',
       connectionHint:
         'Enter this MCP URL in your client and choose OAuth. Sign in to review and authorize its access.',
-      disabled:
-        'OAuth is disabled. Set MCP_OAUTH_ISSUER_URL to the public HTTPS origin of this server.',
+      disabled: 'OAuth connections are disabled. Manual tokens remain available.',
+      allowConnections: 'Allow OAuth connections',
+      frontendMissing: 'Set the frontend URL in system settings. OAuth uses that site address.',
+      frontendInvalid:
+        'The frontend URL must be a public HTTPS origin without a path, query or fragment. Loopback HTTP is supported for local development.',
+      siteSettings: 'Configure frontend URL',
+      statusUnavailable: 'OAuth status is unavailable. Refresh to try again.',
       authorizeTitle: 'Authorize an application',
       identityHint:
         'Check the client identifier and return address. An application name alone does not verify who operates it.',

@@ -193,7 +193,9 @@ export interface MCPOAuthGrant extends MCPToken {
 // MCPOAuthStatus supplies configured discovery availability without any signing credentials.
 export interface MCPOAuthStatus {
   enabled: boolean // OAuth endpoint availability flag.
-  issuer: string // Configured public issuer origin.
+  allowed: boolean // Administrator permits OAuth connections.
+  reason: string // Missing address, invalid address, or disabled switch.
+  issuer: string // Validated frontend URL origin.
   resource: string // Canonical protected MCP URL.
 }
 
@@ -216,6 +218,12 @@ export interface MCPOAuthReview {
 // getOAuthStatus reads the configured OAuth availability for administrator connection guidance.
 export async function getOAuthStatus(signal?: AbortSignal): Promise<MCPOAuthStatus> {
   const { data } = await apiClient.get<MCPOAuthStatus>('/admin/mcp/oauth/status', { signal })
+  return data
+}
+
+// setOAuthEnabled saves the administrator's connection switch and reads its effective status.
+export async function setOAuthEnabled(enabled: boolean): Promise<MCPOAuthStatus> {
+  const { data } = await apiClient.put<MCPOAuthStatus>('/admin/mcp/oauth/status', { enabled })
   return data
 }
 

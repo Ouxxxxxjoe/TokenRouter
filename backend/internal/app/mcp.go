@@ -22,6 +22,7 @@ import (
 	mcphttp "github.com/TokenFlux/TokenRouter/internal/mcp/httpapi"
 	mcpredis "github.com/TokenFlux/TokenRouter/internal/mcp/rediscache"
 	"github.com/TokenFlux/TokenRouter/internal/settings"
+	"github.com/TokenFlux/TokenRouter/internal/site"
 )
 
 // mcp.go assembles dedicated administrator credentials, shared temporary state,
@@ -38,9 +39,7 @@ func provideMCPTokens(db *sql.DB, users *identity.UserService, cipher identity.S
 		cipher = nil
 	}
 	service := identity.NewMCPTokenService(identitypostgres.NewMCPTokenStore(db), users, cipher)
-	if oauth.Enabled() {
-		service.SetOAuth(oauth)
-	}
+	service.SetOAuth(oauth)
 	return service
 }
 
@@ -55,8 +54,8 @@ func provideMCPHTTP(oauth *identityprovider.MCPOAuthServer, tokens *identity.MCP
 	}
 	origins := func(ctx context.Context) []string {
 		allowed := slices.Clone(cfg.CORS.AllowedOrigins)
-		if oauth.Enabled() {
-			allowed = append(allowed, oauth.Issuer())
+		if status, err := oauth.Status(ctx); err == nil && status.Issuer != "" {
+			allowed = append(allowed, status.Issuer)
 		}
 		for _, key := range []string{"api_base_url", "frontend_url"} {
 			value, err := store.GetValue(ctx, key)
@@ -72,23 +71,25 @@ func provideMCPHTTP(oauth *identityprovider.MCPOAuthServer, tokens *identity.MCP
 		}
 		return allowed
 	}
-	return mcphttp.NewHandler(tokens, mcpredis.NewState(client, cipher), totp, users, identitySettings, mcphttp.Options{OAuth: oauth, Origins: origins, BrowserBaseURL: func(ctx context.Context) string { value, _ := store.GetValue(ctx, "frontend_url"); return value }, Limiter: redisinfra.NewFixedWindowLimiter(client, "mcp:rate:")}), nil
+	return mcphttp.NewHandler(tokens, mcpredis.NewState(client, cipher), totp, users, identitySettings, mcphttp.Options{OAuth: oauth, Origins: origins, BrowserBaseURL: func(ctx context.Context) string {
+		return site.ReadFrontendURL(ctx, store, func() string { return cfg.Server.FrontendURL })
+	}, Limiter: redisinfra.NewFixedWindowLimiter(client, "mcp:rate:")}), nil
 }
 
 // mcpArtifactCipher selects a stable encryption key for shared temporary MCP files.
 // Configured TOTP encryption retains the existing ciphertext format and key.
-// OAuth deployments with ephemeral TOTP configuration derive a separate artifact
+// Deployments with ephemeral TOTP configuration derive a separate artifact
 // key from their independently persisted signing secret using a fixed HKDF context.
 //
-// This choice lets different instances decrypt the same Redis file record while
+// This choice lets backend restarts decrypt surviving Redis file records while
 // keeping the HMAC signing key distinct from the AES encryption key. An invalid
 // persisted secret prevents transport construction; changing deployed key material
 // can make earlier temporary files unavailable until their ordinary TTL expires.
 func mcpArtifactCipher(existing identity.SecretEncryptor, cfg *config.Config) (identity.SecretEncryptor, error) {
-	if cfg == nil || cfg.MCP.OAuth.IssuerURL == "" || cfg.Totp.EncryptionKeyConfigured {
+	if cfg == nil || cfg.Totp.EncryptionKeyConfigured {
 		return existing, nil
 	}
-	secret, err := hex.DecodeString(cfg.MCP.OAuth.SigningSecret)
+	secret, err := hex.DecodeString(cfg.MCPOAuthSigningSecret)
 	if err != nil || len(secret) != 32 {
 		return nil, fmt.Errorf("MCP OAuth artifact secret is unavailable")
 	}

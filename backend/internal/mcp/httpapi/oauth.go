@@ -24,7 +24,7 @@ import (
 // neither an MCP credential nor a management API key can approve an application.
 //
 // Public exchange limits are independent from authenticated MCP request limits.
-// The configured issuer supplies every discovery URL and audience. Browser
+// The resolved frontend origin supplies every discovery URL and audience. Browser
 // requests refer to a stored authorization request and session-bound nonce, so
 // submitted client names, callback URLs, or permission strings cannot replace
 // the protocol parameters validated before the consent page was opened.
@@ -44,6 +44,19 @@ var oauthOperations = map[string]*adminapi.Operation{
 		Response:    adminapi.ResponseBrowser,
 		BrowserPath: "/admin/mcp",
 		Input:       adminapi.Arguments("/api/v1/admin/mcp/oauth/status", nil, nil),
+	}),
+	"configure": adminapi.Define(adminapi.Operation{
+		ID:          "mcp.oauth.configure",
+		Module:      "mcp",
+		Title:       "Configure OAuth connections",
+		TitleZH:     "设置 OAuth 连接开关",
+		Description: "Enable or disable OAuth connections in the administrator browser.",
+		Method:      "PUT",
+		Path:        "/api/v1/admin/mcp/oauth/status",
+		Sensitive:   true,
+		Response:    adminapi.ResponseBrowser,
+		BrowserPath: "/admin/mcp",
+		Input:       adminapi.Arguments("/api/v1/admin/mcp/oauth/status", nil, (*oauthConfiguration)(nil)),
 	}),
 	"requests.get": adminapi.Define(adminapi.Operation{
 		ID:          "mcp.oauth.requests.get",
@@ -118,38 +131,59 @@ type oauthDecision struct {
 	Permissions []string `json:"permissions"` // selected exact operation identifiers
 }
 
-// mountOAuth registers discovery and exchange routes when OAuth is configured.
-// Browser management remains mounted while disabled so administrators can inspect
-// and revoke previous grants. Protocol routes never fall through to the SPA.
+// oauthConfiguration carries the administrator's explicit connection availability choice.
+type oauthConfiguration struct {
+	// Enabled is required; nil distinguishes a missing body property from an
+	// explicit false, so an incomplete request cannot accidentally disable connections.
+	Enabled *bool `json:"enabled"` // Required connection switch value.
+}
+
+// mountOAuth registers protocol and browser routes independently of current availability.
+// Each protocol request resolves the current site settings before parsing OAuth
+// parameters. This allows administrators to configure the frontend URL or switch
+// connections on without restarting the backend or rebuilding the route table.
 func (h *Handler) mountOAuth(router *gin.Engine, group *gin.RouterGroup) {
 	adminapi.Register(group, oauthOperations["status"], h.oauthStatus)
+	adminapi.Register(group, oauthOperations["configure"], h.oauthConfigure)
 	adminapi.Register(group, oauthOperations["requests.get"], h.oauthReview)
 	adminapi.Register(group, oauthOperations["requests.decide"], h.oauthDecide)
 	adminapi.Register(group, oauthOperations["grants.list"], h.oauthGrants)
 	adminapi.Register(group, oauthOperations["grants.update"], h.oauthUpdate)
 	adminapi.Register(group, oauthOperations["grants.revoke"], h.oauthRevokeGrant)
-	if h.options.OAuth == nil || !h.options.OAuth.Enabled() {
+	if h.options.OAuth == nil {
 		return
 	}
-	server := h.options.OAuth
-	resource := func(c *gin.Context) {
+	resource := h.oauthProtocol(func(server *provider.MCPOAuthServer, c *gin.Context) {
 		provider.WriteOAuthJSON(c.Writer, 200, gin.H{
 			"resource":                 server.Resource(),
 			"authorization_servers":    []string{server.Issuer()},
 			"scopes_supported":         []string{"mcp"},
 			"bearer_methods_supported": []string{"header"},
 		})
-	}
+	})
 	router.GET("/.well-known/oauth-protected-resource", resource)
 	router.GET("/.well-known/oauth-protected-resource/mcp", resource)
-	router.GET("/.well-known/oauth-authorization-server", func(c *gin.Context) { provider.WriteOAuthJSON(c.Writer, 200, server.Metadata()) })
-	router.GET("/mcp/oauth/authorize", h.oauthLimit("authorize", 30), func(c *gin.Context) {
-		base := h.browserLink(c.Request.Context(), "")
-		server.Start(c.Writer, c.Request, base)
-	})
-	router.POST("/mcp/oauth/register", h.oauthLimit("register", 10), func(c *gin.Context) { server.Register(c.Writer, c.Request) })
-	router.POST("/mcp/oauth/token", h.oauthLimit("token", 60), func(c *gin.Context) { server.Token(c.Writer, c.Request) })
-	router.POST("/mcp/oauth/revoke", h.oauthLimit("revoke", 60), func(c *gin.Context) { server.Revoke(c.Writer, c.Request) })
+	router.GET("/.well-known/oauth-authorization-server", h.oauthProtocol(func(server *provider.MCPOAuthServer, c *gin.Context) {
+		provider.WriteOAuthJSON(c.Writer, 200, server.Metadata())
+	}))
+	router.GET("/mcp/oauth/authorize", h.oauthLimit("authorize", 30), h.oauthProtocol(func(server *provider.MCPOAuthServer, c *gin.Context) { server.Start(c.Writer, c.Request) }))
+	router.POST("/mcp/oauth/register", h.oauthLimit("register", 10), h.oauthProtocol(func(server *provider.MCPOAuthServer, c *gin.Context) { server.Register(c.Writer, c.Request) }))
+	router.POST("/mcp/oauth/token", h.oauthLimit("token", 60), h.oauthProtocol(func(server *provider.MCPOAuthServer, c *gin.Context) { server.Token(c.Writer, c.Request) }))
+	router.POST("/mcp/oauth/revoke", h.oauthLimit("revoke", 60), h.oauthProtocol(func(server *provider.MCPOAuthServer, c *gin.Context) { server.Revoke(c.Writer, c.Request) }))
+}
+
+// oauthProtocol binds one site's current origin for the entire protocol response.
+// Disabled settings and read failures produce a standard OAuth error before
+// invoking the protocol callback; the route never falls through to SPA content.
+func (h *Handler) oauthProtocol(handle func(*provider.MCPOAuthServer, *gin.Context)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		server, err := h.options.OAuth.Current(c.Request.Context())
+		if err != nil {
+			provider.WriteOAuthJSON(c.Writer, http.StatusServiceUnavailable, gin.H{"error": "temporarily_unavailable"})
+			return
+		}
+		handle(server, c)
+	}
 }
 
 // oauthLimit bounds unauthenticated protocol traffic by trusted client address and route.
@@ -213,16 +247,39 @@ func (h *Handler) oauthBrowser(c *gin.Context) bool {
 	return true
 }
 
-// oauthStatus returns configured connection information without exposing any signing material.
+// oauthStatus reports current frontend-derived availability and address validation feedback.
+// Settings read failures remain errors instead of masquerading as a disabled
+// switch, allowing the browser to retain its last confirmed connection state.
 func (h *Handler) oauthStatus(c *gin.Context) {
-	if !browserSession(c) {
+	if !h.oauthBrowser(c) {
 		return
 	}
-	result := gin.H{"enabled": false, "issuer": "", "resource": ""}
-	if server := h.options.OAuth; server != nil && server.Enabled() {
-		result = gin.H{"enabled": true, "issuer": server.Issuer(), "resource": server.Resource()}
+	status, err := h.options.OAuth.Status(c.Request.Context())
+	if err != nil {
+		httpx.ErrorFrom(c, err)
+		return
 	}
-	httpx.Success(c, result)
+	httpx.Success(c, status)
+}
+
+// oauthConfigure persists the administrator's connection switch after recent verification.
+// Missing values and nonbrowser credentials are rejected before changing settings.
+// The response contains the validated status used by subsequent OAuth requests.
+func (h *Handler) oauthConfigure(c *gin.Context) {
+	if !h.oauthBrowser(c) || !h.checkBrowserStepUp(c) {
+		return
+	}
+	var input oauthConfiguration
+	if httpx.BindJSONStrict(c, &input) != nil || input.Enabled == nil {
+		httpx.BadRequest(c, "Specify whether OAuth connections are enabled")
+		return
+	}
+	status, err := h.options.OAuth.SetEnabled(c.Request.Context(), *input.Enabled)
+	if err != nil {
+		httpx.ErrorFrom(c, err)
+		return
+	}
+	httpx.Success(c, status)
 }
 
 // oauthReview returns a validated request, existing grants, and available operation choices.
@@ -230,12 +287,13 @@ func (h *Handler) oauthReview(c *gin.Context) {
 	if !h.oauthBrowser(c) {
 		return
 	}
-	if !h.options.OAuth.Enabled() {
-		httpx.ErrorWithDetails(c, 503, "OAuth is disabled", "MCP_OAUTH_UNAVAILABLE", nil)
+	server, err := h.options.OAuth.Current(c.Request.Context())
+	if err != nil {
+		httpx.ErrorFrom(c, err)
 		return
 	}
 	principal, _ := authctx.GetPrincipal(c)
-	review, err := h.options.OAuth.Review(c.Request.Context(), c.Param("id"), principal.UserID, principal.SessionID)
+	review, err := server.Review(c.Request.Context(), c.Param("id"), principal.UserID, principal.SessionID)
 	if err != nil {
 		httpx.ErrorFrom(c, err)
 		return
@@ -256,8 +314,9 @@ func (h *Handler) oauthDecide(c *gin.Context) {
 	if !h.oauthBrowser(c) {
 		return
 	}
-	if !h.options.OAuth.Enabled() {
-		httpx.ErrorWithDetails(c, 503, "OAuth is disabled", "MCP_OAUTH_UNAVAILABLE", nil)
+	server, err := h.options.OAuth.Current(c.Request.Context())
+	if err != nil {
+		httpx.ErrorFrom(c, err)
 		return
 	}
 	var input oauthDecision
@@ -281,7 +340,7 @@ func (h *Handler) oauthDecide(c *gin.Context) {
 		}
 	}
 	principal, _ := authctx.GetPrincipal(c)
-	target, err := h.options.OAuth.Decide(c.Request.Context(), c.Param("id"), principal.UserID, principal.SessionID, input.Nonce, input.Approve, input.Permissions)
+	target, err := server.Decide(c.Request.Context(), c.Param("id"), principal.UserID, principal.SessionID, input.Nonce, input.Approve, input.Permissions)
 	if err != nil {
 		httpx.ErrorFrom(c, err)
 		return

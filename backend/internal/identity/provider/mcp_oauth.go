@@ -11,7 +11,6 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,12 +37,15 @@ import (
 // MCPOAuthServer connects protocol validation to administrator grants and durable storage.
 // @project-doc docs/interfaces/mcp_management.md#oauth_authorization
 type MCPOAuthServer struct {
-	repo       identity.MCPOAuthRepository // durable OAuth exchange repository
-	users      identity.MCPUserReader      // current administrator account reader
-	issuer     string                      // canonical configured issuer origin
-	secret     []byte                      // independent persisted signing secret
-	protocol   fosite.OAuth2Provider       // enabled OAuth protocol handlers
-	clientHTTP *http.Client                // bounded SSRF-protected metadata client
+	repo   identity.MCPOAuthRepository // durable OAuth exchange repository
+	users  identity.MCPUserReader      // current administrator account reader
+	issuer string                      // canonical frontend origin for this request
+	// settings belongs to the root service; request instances clear it after
+	// binding an origin so nested storage calls retain the same configuration.
+	settings   MCPOAuthSettings
+	secret     []byte                // independent persisted signing secret
+	protocol   fosite.OAuth2Provider // enabled OAuth protocol handlers
+	clientHTTP *http.Client          // bounded SSRF-protected metadata client
 }
 
 // MCPOAuthReview contains browser-safe request details and session-bound decision proof.
@@ -53,33 +55,32 @@ type MCPOAuthReview struct {
 	Grant   *identity.MCPOAuthGrant   `json:"grant"`   // previous live application authorization
 }
 
-// NewMCPOAuthServer constructs the enabled protocol without starting background work.
-// The caller supplies a canonical issuer and independent persistent signing key.
-// An empty issuer disables OAuth; all instances must share the same repository.
-func NewMCPOAuthServer(repo identity.MCPOAuthRepository, users identity.MCPUserReader, issuer string, secret []byte) *MCPOAuthServer {
-	server := &MCPOAuthServer{repo: repo, users: users, issuer: issuer, secret: slices.Clone(secret), clientHTTP: newCIMDHTTPClient()}
-	if issuer == "" {
-		return server
-	}
+// NewMCPOAuthServer binds live site settings and persistent OAuth credentials.
+// Current resolves an immutable protocol instance for each incoming request.
+// The settings source must remain available throughout the server lifetime;
+// failed reads deny OAuth access while grant management remains available.
+func NewMCPOAuthServer(repo identity.MCPOAuthRepository, users identity.MCPUserReader, settings MCPOAuthSettings, secret []byte) *MCPOAuthServer {
+	return &MCPOAuthServer{repo: repo, users: users, settings: settings, secret: append([]byte(nil), secret...), clientHTTP: newCIMDHTTPClient()}
+}
+
+// enableProtocol binds Fosite to this request's resolved frontend origin.
+// Only Current calls this method on a private copy before publishing it.
+// Credential stores therefore retain the same issuer through the complete exchange.
+func (s *MCPOAuthServer) enableProtocol() {
 	// Short access and code lifetimes bound leaked credentials; rotating refresh
 	// families keep unattended connections usable until thirty days pass without renewal.
 	config := &fosite.Config{
-		GlobalSecret:          server.secret,
-		AccessTokenLifespan:   15 * time.Minute,
-		AuthorizeCodeLifespan: 5 * time.Minute,
-		RefreshTokenLifespan:  30 * 24 * time.Hour,
-		EnforcePKCE:           true,
-		RefreshTokenScopes:    []string{},
-		ScopeStrategy:         fosite.ExactScopeStrategy,
+		GlobalSecret: s.secret, AccessTokenLifespan: 15 * time.Minute,
+		AuthorizeCodeLifespan: 5 * time.Minute, RefreshTokenLifespan: 30 * 24 * time.Hour,
+		EnforcePKCE: true, RefreshTokenScopes: []string{}, ScopeStrategy: fosite.ExactScopeStrategy,
 	}
-	server.protocol = compose.Compose(config, &oauthStore{server: server}, compose.NewOAuth2HMACStrategy(config), compose.OAuth2AuthorizeExplicitFactory, compose.OAuth2RefreshTokenGrantFactory, compose.OAuth2PKCEFactory, compose.OAuth2TokenRevocationFactory, compose.OAuth2TokenIntrospectionFactory)
-	return server
+	s.protocol = compose.Compose(config, &oauthStore{server: s}, compose.NewOAuth2HMACStrategy(config), compose.OAuth2AuthorizeExplicitFactory, compose.OAuth2RefreshTokenGrantFactory, compose.OAuth2PKCEFactory, compose.OAuth2TokenRevocationFactory, compose.OAuth2TokenIntrospectionFactory)
 }
 
-// Enabled reports whether the deployment configured a complete OAuth issuer.
+// Enabled reports whether this request has a complete, resolved OAuth protocol.
 func (s *MCPOAuthServer) Enabled() bool { return s != nil && s.protocol != nil && len(s.secret) >= 32 }
 
-// Issuer returns the deployment-configured authority used for discovery and callbacks.
+// Issuer returns the resolved frontend origin used for discovery and callbacks.
 func (s *MCPOAuthServer) Issuer() string { return s.issuer }
 
 // Resource returns the canonical MCP audience bound to every OAuth credential.
@@ -162,7 +163,7 @@ func (s *MCPOAuthServer) Metadata() map[string]any {
 // state across the administrator login. Only the fields needed to reconstruct
 // that validated request are persisted; unrelated query members cannot become
 // credentials or change the later browser decision.
-func (s *MCPOAuthServer) Start(w http.ResponseWriter, r *http.Request, browserBase string) {
+func (s *MCPOAuthServer) Start(w http.ResponseWriter, r *http.Request) {
 	form, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil || !singleOAuthValues(form) {
 		s.authorizeError(w, r, nil, fosite.ErrInvalidRequest)
@@ -206,10 +207,7 @@ func (s *MCPOAuthServer) Start(w http.ResponseWriter, r *http.Request, browserBa
 		s.authorizeError(w, r, request, fosite.ErrServerError)
 		return
 	}
-	if browserBase == "" {
-		browserBase = s.issuer
-	}
-	http.Redirect(w, r, strings.TrimRight(browserBase, "/")+"/admin/mcp/authorize?request="+url.QueryEscape(id), http.StatusFound)
+	http.Redirect(w, r, s.issuer+"/admin/mcp/authorize?request="+url.QueryEscape(id), http.StatusFound)
 }
 
 // authorizeError sends a protocol error only to a previously validated callback.
@@ -242,6 +240,8 @@ func (s *MCPOAuthServer) authorizeError(w http.ResponseWriter, r *http.Request, 
 // Review binds a pending request to the authenticated administrator's browser session.
 // Repeated reads in the same session return the same nonce and current grants.
 // Account switching or a different browser cannot claim an already bound request.
+// Reconnecting after a site address change shows the same client's existing
+// permissions; only a new decision can bind them to the current resource.
 func (s *MCPOAuthServer) Review(ctx context.Context, id string, userID int64, sessionID string) (*MCPOAuthReview, error) {
 	if err := s.administrator(ctx, userID); err != nil {
 		return nil, err
@@ -253,13 +253,16 @@ func (s *MCPOAuthServer) Review(ctx context.Context, id string, userID int64, se
 	if err != nil {
 		return nil, err
 	}
+	if request.Form.Get("resource") != s.Resource() {
+		return nil, apperror.BadRequest("MCP_OAUTH_REQUEST_INVALID", "Site address changed; reconnect")
+	}
 	grants, err := s.repo.ListGrants(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	review := &MCPOAuthReview{Request: request, Nonce: s.nonce(id, userID, sessionID)}
 	for _, grant := range grants {
-		if grant.ClientID == request.Client.ID && grant.Resource == s.Resource() && grant.RevokedAt == nil {
+		if grant.ClientID == request.Client.ID && grant.RevokedAt == nil {
 			review.Grant = &grant
 			break
 		}
@@ -288,6 +291,9 @@ func (s *MCPOAuthServer) Decide(ctx context.Context, id string, userID int64, se
 		pending, err := s.repo.ConsumePending(ctx, id, userID, sessionID)
 		if err != nil {
 			return err
+		}
+		if pending.Form.Get("resource") != s.Resource() {
+			return apperror.BadRequest("MCP_OAUTH_REQUEST_INVALID", "Site address changed; reconnect")
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.issuer+"/mcp/oauth/authorize?"+pending.Form.Encode(), nil)
 		if err != nil {
@@ -403,9 +409,14 @@ func (s *MCPOAuthServer) Revoke(w http.ResponseWriter, r *http.Request) {
 func (s *MCPOAuthServer) Authenticate(ctx context.Context, credential string) (*identity.MCPToken, error) {
 	// Reject foreign credential formats before database lookup; the bounded length
 	// also prevents oversized invalid Bearer values from reaching the protocol store.
-	if !s.Enabled() || len(credential) > 512 || !strings.HasPrefix(credential, "ory_at_") {
+	if len(credential) > 512 || !strings.HasPrefix(credential, "ory_at_") {
 		return nil, identity.ErrMCPTokenInvalid
 	}
+	current, err := s.Current(ctx)
+	if err != nil {
+		return nil, identity.ErrMCPTokenInvalid
+	}
+	s = current
 	kind, request, err := s.protocol.IntrospectToken(ctx, credential, fosite.AccessToken, &oauthSession{}, "mcp")
 	if err != nil || kind != fosite.AccessToken {
 		return nil, identity.ErrMCPTokenInvalid
@@ -428,6 +439,11 @@ func (s *MCPOAuthServer) Authenticate(ctx context.Context, credential string) (*
 // Disabled, expired, revoked, or demoted owners cannot authorize later requests.
 // Reading a stable grant does not require a particular rotating access credential.
 func (s *MCPOAuthServer) AuthorizeGrant(ctx context.Context, id int64) (*identity.MCPToken, error) {
+	current, err := s.Current(ctx)
+	if err != nil {
+		return nil, identity.ErrMCPTokenInvalid
+	}
+	s = current
 	grant, err := s.repo.GetGrant(ctx, id)
 	if err != nil || grant.Resource != s.Resource() || !grant.Enabled || grant.RevokedAt != nil || grant.ExpiresAt != nil && !time.Now().Before(*grant.ExpiresAt) {
 		return nil, identity.ErrMCPTokenInvalid
