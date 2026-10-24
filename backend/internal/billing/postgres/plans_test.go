@@ -12,6 +12,10 @@ import (
 	sqlitetest "github.com/TokenFlux/TokenRouter/internal/testutil/sqlite"
 )
 
+// plans_test.go checks plan group normalization and transactional mapping writes.
+// The SQLite fixture enforces group foreign keys so a failed mapping insert
+// exercises rollback of the plan row saved earlier in the same transaction.
+
 // TestNormalizePlanGroupIDs_DeduplicatesAndPreservesLegacyGroupID supplies
 // legacy ID three alongside duplicate and nonpositive list entries. The
 // normalized sequence must keep the legacy ID first and retain accepted list
@@ -51,10 +55,10 @@ func TestNormalizePlanGroupRateMultipliers_RejectsNonPositiveRate(t *testing.T) 
 	require.Equal(t, "PLAN_GROUP_RATE_INVALID", apperror.Reason(err))
 }
 
-// TestCreatePlan_RollsBackWhenGroupMappingSyncFails creates a
-// foreign-key-enforced mapping table and requests a missing group ID. Creation
-// must fail and leave no plan row with the requested name, checking the owned
-// transaction covers mapping synchronization.
+// TestCreatePlan_RollsBackWhenGroupMappingSyncFails calls the plan store with a
+// normalized selection whose group is missing. The mapping insert must fail
+// with a foreign-key error and roll back the plan row saved earlier in the
+// transaction.
 func TestCreatePlan_RollsBackWhenGroupMappingSyncFails(t *testing.T) {
 	ctx := context.Background()
 	client := sqlitetest.NewClient(t)
@@ -70,8 +74,10 @@ func TestCreatePlan_RollsBackWhenGroupMappingSyncFails(t *testing.T) {
 	`)
 	require.NoError(t, err)
 
-	svc := billing.NewPlans(NewPlanStore(client), nil)
-	_, err = svc.CreatePlan(ctx, billing.CreatePlanRequest{
+	// Call the store directly so group-existence validation cannot reject the
+	// request before the transaction saves the plan.
+	store := NewPlanStore(client)
+	_, err = store.CreatePlan(ctx, billing.CreatePlanRequest{
 		Name:         "rollback-plan",
 		Description:  "mapping sync should fail",
 		Price:        1,
@@ -81,7 +87,7 @@ func TestCreatePlan_RollsBackWhenGroupMappingSyncFails(t *testing.T) {
 		ForSale:      true,
 	})
 
-	require.Error(t, err)
+	require.ErrorContains(t, err, "FOREIGN KEY constraint failed")
 	count, countErr := client.SubscriptionPlan.Query().
 		Where(subscriptionplan.NameEQ("rollback-plan")).
 		Count(ctx)
