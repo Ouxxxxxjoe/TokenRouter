@@ -135,6 +135,7 @@ vi.mock('fabric', () => {
    * canvas tests.
    */
   class MockCanvas {
+    upperCanvasEl = document.createElement('canvas') // canvas interaction element
     viewportTransform: [number, number, number, number, number, number] = [1, 0, 0, 1, 0, 0] // current affine viewport transform
     width = 800 // horizontal dimension pixels
     height = 600 // vertical dimension pixels

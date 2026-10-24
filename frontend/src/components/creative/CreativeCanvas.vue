@@ -825,6 +825,12 @@ onMounted(() => {
     selectionLineWidth: 1,
     defaultCursor: 'grab',
   })
+  /**
+   * Fabric enables native dragging on its interaction canvas for text transfers.
+   * Disable that drag source so browser drag startup cannot interrupt viewport
+   * panning; image imports still arrive through the container's drop handlers.
+   */
+  canvas.upperCanvasEl.draggable = false
   const maskElement = maskCanvasElRef.value
   if (maskElement) {
     maskElement.style.opacity = String(MASK_OPACITY)
