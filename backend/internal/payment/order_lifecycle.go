@@ -2,6 +2,7 @@ package payment
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -310,11 +311,18 @@ func (s *OrderLifecycle) QueryPaymentOrderProvider(ctx context.Context, o *Order
 // QueryPaymentOrderWithProvider invokes QueryOrder with the supplied usable
 // provider/reference and wraps query errors. The observation callback brackets
 // the call; a nil successful response becomes an error so later state handling
-// receives usable data.
+// receives usable data. An explicitly absent EasyPay order is unpaid for
+// polling and cancellation; callback confirmation still uses QueryOrder directly.
 func (s *OrderLifecycle) QueryPaymentOrderWithProvider(ctx context.Context, prov Provider, queryRef string) (*QueryOrderResponse, error) {
 	finishProviderCall := s.observe(ctx)
 	resp, err := prov.QueryOrder(ctx, queryRef)
 	finishProviderCall()
+	// Hosted EasyPay checkout can be abandoned before the channel creates an
+	// order. Its explicit absence permits cancellation while transport and
+	// credential failures remain errors.
+	if GetBasePaymentType(prov.ProviderKey()) == TypeEasyPay && errors.Is(err, ErrProviderOrderNotFound) {
+		return &QueryOrderResponse{Status: ProviderStatusPending}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query upstream payment %s: %w", queryRef, err)
 	}
@@ -334,6 +342,8 @@ func (s *OrderLifecycle) QueryPaymentOrderWithProvider(ctx context.Context, prov
 // returns uncertain,nil. A distinct upstream trade reference is saved before
 // notification and written into the caller order only after that save
 // succeeds. Fulfillment then validates amount/provider metadata separately.
+// EasyPay records its queried reference with the paid transition after order
+// validation, keeping concurrent queries from changing a fulfillment lease.
 // Processing uses reported or saved trade reference and the normal progress
 // notification, while queried failure returns its label without invoking
 // failure handling here. Other statuses return empty,nil.
@@ -359,8 +369,15 @@ func (s *OrderLifecycle) ApplyQueriedPaymentStatus(ctx context.Context, o *Order
 			}
 			resp = retriedResp
 		}
+		if err := validateEasyPayTradeNumber(o, prov.ProviderKey(), resp.TradeNo); err != nil {
+			return LifecycleCheckPaidResultUncertain, err
+		}
 		notificationTradeNo := o.PaymentTradeNo
-		if upstreamTradeNo := strings.TrimSpace(resp.TradeNo); PaymentOrderShouldPersistUpstreamTradeNo(queryRef, upstreamTradeNo, notificationTradeNo) {
+		if GetBasePaymentType(prov.ProviderKey()) == TypeEasyPay {
+			// Publish EasyPay's identity with the paid transition. A separate reference
+			// update could change updated_at after a concurrent callback claimed fulfillment.
+			notificationTradeNo = resp.TradeNo
+		} else if upstreamTradeNo := strings.TrimSpace(resp.TradeNo); PaymentOrderShouldPersistUpstreamTradeNo(queryRef, upstreamTradeNo, notificationTradeNo) {
 			// Save a newly revealed upstream resource reference before creating its
 			// success notification. Only successful persistence changes the caller
 			// observation, and a write error accompanies the already-paid query

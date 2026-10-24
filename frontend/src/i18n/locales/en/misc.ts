@@ -738,6 +738,10 @@ export default {
       INVALID_STATUS: 'The current order status does not allow this operation.',
       BALANCE_NOT_ENOUGH: 'Refund amount exceeds balance.',
       REFUND_AMOUNT_EXCEEDED: 'Refund amount exceeds the recharge amount.',
+      REFUND_RECOVERY_REQUIRED:
+        'The refund result is unconfirmed. Verify it with the payment provider before taking further action. Do not submit another refund.',
+      REFUND_QUERY_UNSUPPORTED:
+        'This payment provider does not support refund status queries. Verify the refund in the provider console.',
       REFUND_FAILED: 'Refund failed.',
       BILLING_INFO_REQUIRED: 'Billing information is required.',
       BILLING_NAME_REQUIRED: 'Billing name is required.',

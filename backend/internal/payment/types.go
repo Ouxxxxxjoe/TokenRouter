@@ -2,6 +2,7 @@ package payment
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -111,6 +112,11 @@ const (
 	// WeChat invocation payload is ready.
 	CreatePaymentResultJSAPIReady CreatePaymentResultType = "jsapi_ready"
 )
+
+// ErrProviderOrderNotFound identifies a valid channel query rejecting an
+// absent merchant order. Draft connectivity probes accept this response while
+// payment confirmation callers retain it as an unsuccessful lookup.
+var ErrProviderOrderNotFound = errors.New("provider order not found")
 
 // PaymentType is the string method label used by payment adapter interfaces.
 type PaymentType = string

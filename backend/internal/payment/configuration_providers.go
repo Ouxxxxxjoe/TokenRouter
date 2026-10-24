@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -289,8 +290,9 @@ func (s *ConfigService) CreateProviderInstance(ctx context.Context, req CreatePr
 //
 // Saved-instance testing rereads and merges config so omitted/blank recognized
 // secrets can be reused, while unsaved input remains supplied data.
-// Constructor errors become invalid-config and query errors become test-failed
-// with causes retained. The query candidate is not persisted and this
+// A recognized missing-order reply confirms this synthetic probe reached the
+// channel. Constructor errors become invalid-config and other query errors
+// become test-failed with causes retained. The query candidate is not persisted and this
 // operation does not submit payment/refund, but it performs the external read
 // through the adapter when invoked.
 func (s *ConfigService) TestProviderDraft(ctx context.Context, req TestProviderDraftRequest) (*ProviderDraftTestResult, error) {
@@ -325,7 +327,7 @@ func (s *ConfigService) TestProviderDraft(ctx context.Context, req TestProviderD
 	if err != nil {
 		return nil, infraerrors.BadRequest("PAYMENT_PROVIDER_TEST_INVALID_CONFIG", "payment provider test configuration is invalid").WithCause(err)
 	}
-	if _, err := prov.QueryOrder(ctx, s.runtime.NewTradeNo()); err != nil {
+	if _, err := prov.QueryOrder(ctx, s.runtime.NewTradeNo()); err != nil && !errors.Is(err, ErrProviderOrderNotFound) {
 		return nil, infraerrors.ServiceUnavailable("PAYMENT_PROVIDER_TEST_FAILED", "payment provider test failed").WithCause(err)
 	}
 	return &ProviderDraftTestResult{Reachable: true}, nil

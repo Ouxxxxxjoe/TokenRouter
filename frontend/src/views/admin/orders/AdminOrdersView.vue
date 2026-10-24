@@ -443,7 +443,7 @@ import { formatPaymentAmount } from '@/utils/payment/currency'
 // order currency.
 //
 // Refund responses determine whether the dialog closes or remains open for force consent.
-// A successful or pending result refreshes the list, while require_force retains the draft
+// A successful, pending, or unconfirmed refund refreshes the list; require_force retains the draft
 // and exposes the server warning. Force expiration requires a reason and confirmation, and
 // a status conflict closes its stale confirmation before reloading orders. Per-order
 // refund-query indicators track which row has an outstanding query.
@@ -807,7 +807,8 @@ function isRefundPendingWarning(warning: string | undefined): boolean {
 
 // handleRefund submits the dialog draft for the currently selected order and interprets
 // the refund response. Success closes the editor and starts a list refresh. A warning
-// recognized as pending follows the same close-and-refresh path with a warning message. A
+// recognized as pending follows the same close-and-refresh path with a warning message. An
+// unconfirmed outcome closes the editor and refreshes the claimed refund state. A
 // force requirement keeps the editor open and exposes server guidance so the administrator
 // can consent before resubmitting. Other failures retain the draft, and the submitting
 // indicator clears after response handling.
@@ -847,6 +848,14 @@ async function handleRefund(data: {
     }
     appStore.showError(res.data.warning || t('common.error'))
   } catch (err: unknown) {
+    if (extractApiErrorCode(err) === 'REFUND_RECOVERY_REQUIRED') {
+      // The external refund may have completed. Close the stale submission form and
+      // reload its claimed state before another action can be selected for this order.
+      closeRefundDialog()
+      await loadOrders()
+      appStore.showWarning(t('payment.errors.REFUND_RECOVERY_REQUIRED'))
+      return
+    }
     appStore.showError(extractI18nErrorMessage(err, t, 'payment.errors', t('common.error')))
   } finally {
     refundSubmitting.value = false

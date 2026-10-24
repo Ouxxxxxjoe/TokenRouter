@@ -17,6 +17,7 @@ import (
 // Preparation, compensation, and finalization use separate store transactions,
 // with the provider call between them and receipt identity carrying the
 // previously committed local recovery.
+// An unknown channel outcome retains that preparation for manual verification.
 //
 // Pending observations restore prepared rights and retain provider identity
 // for later query. Immediate success finalizes the prepared deduction, while
@@ -31,9 +32,10 @@ import (
 // the gateway request. Preparation failure returns before external submission,
 // and the store publishes committed mutation results into the plan.
 //
-// The gateway call runs between short store transactions. An error chooses
-// compensation, while a response goes through FinishRefund for pending or
-// successful local settlement. A later store failure can leave the already
+// The gateway call runs between short store transactions. An unknown outcome
+// retains preparation for verification; other errors choose compensation,
+// while a response goes through FinishRefund for pending or successful local
+// settlement. A later store failure can leave the already
 // committed preparation and externally attempted refund for recovery; this
 // method does not resubmit the gateway after that local failure.
 func (s *RefundWorkflow) ExecuteRefund(ctx context.Context, p *RefundPlan) (*RefundResult, error) {
@@ -49,6 +51,11 @@ func (s *RefundWorkflow) ExecuteRefund(ctx context.Context, p *RefundPlan) (*Ref
 	// error in its separate transaction.
 	resp, err := s.GwRefund(ctx, p)
 	if err != nil {
+		// The channel may have transferred money before its response was lost.
+		// Keep the prepared deduction and claim so another submission cannot double-refund.
+		if errors.Is(err, ErrRefundOutcomeUnknown) {
+			return nil, RefundRecoveryRequired(err.Error())
+		}
 		return s.compensateFailure(ctx, p, receipt, err)
 	}
 	return s.FinishRefund(ctx, p, receipt, resp)

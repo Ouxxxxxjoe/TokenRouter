@@ -2,6 +2,7 @@ package payment
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/TokenFlux/TokenRouter/internal/pkg/apperror"
@@ -23,6 +24,11 @@ import (
 // stored false. Ordinary observation callbacks have their own audit policy,
 // while preparation and success records participate in the transaction that
 // establishes refund progress.
+
+// ErrRefundOutcomeUnknown marks an attempted channel refund whose outcome
+// requires verification. The workflow retains its prepared deduction and
+// recovery receipt when an adapter wraps this sentinel.
+var ErrRefundOutcomeUnknown = errors.New("refund outcome is unknown")
 
 // RefundPlan retains an order observation, refund intent, and mutable
 // deduction results.

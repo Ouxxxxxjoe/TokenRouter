@@ -142,6 +142,30 @@ describe('AdminOrdersView', () => {
     })
   })
 
+  // An unconfirmed channel reply leaves the server order claimed for recovery. The
+  // page closes its stale draft, reloads that state, and blocks another refund submission.
+  it('refreshes and closes the refund dialog when recovery is required', async () => {
+    mockRefundOrder.mockRejectedValueOnce({
+      reason: 'REFUND_RECOVERY_REQUIRED',
+      message: 'manual verification',
+    })
+    const wrapper = mountView()
+    await flushPromises()
+    await findRefundAction(wrapper)!.trigger('click')
+    await flushPromises()
+    mockGetOrders.mockResolvedValueOnce({
+      data: { items: [{ ...order, status: 'REFUNDING' }], total: 1 },
+    })
+    await wrapper.find('#refund-form').trigger('submit')
+    await flushPromises()
+    expect(wrapper.find('#refund-form').exists()).toBe(false)
+    expect(mockGetOrders).toHaveBeenCalledTimes(2)
+    expect(mockShowWarning).toHaveBeenCalledWith('payment.errors.REFUND_RECOVERY_REQUIRED')
+    expect(findRefundAction(wrapper)).toBeUndefined()
+    expect(mockRefundOrder).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
   // The refund API requires force consent after the initial submission. The dialog must
   // retain the warning, require the checkbox before retry, and clear that state when
   // reopened.

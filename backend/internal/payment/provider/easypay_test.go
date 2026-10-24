@@ -2,21 +2,25 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/TokenFlux/TokenRouter/internal/payment"
 )
 
-// EasyPay callback fixtures sign form values locally and distinguish accepted
+// easypay_test.go signs callback fixtures locally and distinguishes accepted
 // notification keys from checkout parameters, duplicate values and
 // delimiter-bearing structured fields. Query fixtures exercise status
-// precedence across JSON layouts and keep requested merchant labels when
-// upstream references are absent.
+// precedence across JSON layouts and reject paid observations lacking actual
+// upstream transaction references.
 //
 // Loopback refund fixtures capture alternative identifier forms in order,
 // returning missing-order text before a successful trade-reference attempt.
@@ -25,6 +29,19 @@ import (
 // Signing tests cover parameter order and excluded fields independently of
 // callback structure, while bounded diagnostic fixtures assert valid UTF-8 at
 // the truncated prefix.
+
+// easyPayQueryFailingTransport returns a nested credential-bearing request
+// error for query diagnostic tests.
+type easyPayQueryFailingTransport struct {
+	cause error // nested request failure identity
+}
+
+// RoundTrip includes the request URL in a wrapped failure and returns no
+// response. The synthetic transport makes secret-bearing inner errors visible
+// to the query adapter without contacting a remote merchant.
+func (transport easyPayQueryFailingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("request %s failed: %w", request.URL.String(), transport.cause)
+}
 
 // TestEasyPayNotificationRejectsCheckoutParameters generates a signed
 // hosted-checkout query and submits it as callback form text. It expects
@@ -56,6 +73,275 @@ func TestEasyPayNotificationRejectsCheckoutParameters(t *testing.T) {
 	}
 }
 
+// TestEasyPayNotificationRejectsCheckoutSignatureReplay rebuilds the historical
+// return-url delimiter replay entirely in memory. The callback has the checkout
+// digest but is rejected before upstream access because checkout fields remain forbidden.
+func TestEasyPayNotificationRejectsCheckoutSignatureReplay(t *testing.T) {
+	t.Parallel()
+	e := &EasyPay{config: map[string]string{"pid": "1000", "pkey": "test-secret", "apiBase": "https://pay.example.com", "paymentMode": "popup", "notifyUrl": "https://site.example.com/notify"}}
+	prefix := "https://site.example.com/payment/result?status=success"
+	created, err := e.CreatePayment(context.Background(), payment.CreatePaymentRequest{
+		OrderID: "ORDER123", PaymentType: "alipay", Subject: "test", Amount: "650.00",
+		ReturnURL: prefix + "&trade_status=TRADE_SUCCESS",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(created.PayURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := parsed.Query()
+	values.Set("return_url", prefix)
+	values.Set("trade_status", tradeStatusSuccess)
+	params := make(map[string]string, len(values))
+	for key := range values {
+		params[key] = values.Get(key)
+	}
+	if !easyPayVerifySign(params, e.config["pkey"], values.Get("sign")) {
+		t.Fatal("fixture did not preserve the checkout signature")
+	}
+	notification, err := e.VerifyNotification(context.Background(), values.Encode(), nil)
+	if err == nil || notification != nil || !strings.Contains(err.Error(), "unexpected notify param") {
+		t.Fatalf("replayed checkout signature accepted: %+v, %v", notification, err)
+	}
+}
+
+// TestEasyPayNotificationRequiresUpstreamConfirmation supplies valid signatures
+// with inconsistent or unavailable upstream orders. Every such notification
+// fails before it can provide an accepted success observation to fulfillment.
+func TestEasyPayNotificationRequiresUpstreamConfirmation(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"code":1,"status":0,"money":"650.00","trade_no":"UPSTREAM123"}`,
+		`{"code":0,"status":1,"money":"650.00","trade_no":"UPSTREAM123"}`,
+		`{"code":1,"status":1,"money":"649.99","trade_no":"UPSTREAM123"}`,
+		`{"code":1,"status":1,"money":"650.00","trade_no":"another-trade"}`,
+		`{"code":1,"status":1,"money":"650.00"}`,
+		`{"code":1,"status":1,"money":"NaN","trade_no":"UPSTREAM123"}`,
+		`{"code":1,"status":1,"money":"650.001","trade_no":"UPSTREAM123"}`,
+		`{"code":1,"status":1,"money":"650.00","trade_no":"UPSTREAM123","pid":2000}`,
+		`{"code":1,"status":1,"money":"650.00","trade_no":"UPSTREAM123","out_trade_no":"another-order"}`,
+		`{"code":1,"status":1,"money":"650.00","trade_no":"UPSTREAM123","data":{"pid":"2000"}}`,
+		`{"code":1.5,"status":1,"money":"650.00","trade_no":"UPSTREAM123"}`,
+		`<html>error</html>`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			// Keep the fixture response available until verification returns, then
+			// close its listener so later parallel cases own independent merchant endpoints.
+			t.Cleanup(server.Close)
+			e := &EasyPay{config: map[string]string{"pid": "1000", "pkey": "secret", "apiBase": server.URL}}
+			notification, err := e.VerifyNotification(context.Background(), signedEasyPayTestNotification(e), nil)
+			if err == nil || notification != nil {
+				t.Fatalf("unconfirmed payment accepted: %+v, %v", notification, err)
+			}
+		})
+	}
+}
+
+// TestEasyPayQueryCancellationRedactsCredentials expires a lookup context
+// while the local merchant holds its response. Cancellation remains detectable
+// and the returned diagnostic contains neither the key nor the request query.
+func TestEasyPayQueryCancellationRedactsCredentials(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Consume the submitted form before waiting so connection cancellation can
+		// terminate this handler while the client exercises its bounded request lifetime.
+		_ = r.ParseForm()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	e := newTestEasyPay(t, server.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := e.QueryOrder(ctx, "order-123")
+	if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "pkey-1") || strings.Contains(err.Error(), "?act=") {
+		t.Fatalf("unexpected query error: %v", err)
+	}
+}
+
+// TestEasyPayQueryRedirectErrorRedactsCredentials receives an invalid redirect
+// path echoing the authenticated query. Neither returned diagnostics nor their
+// unwrap chain may retain the raw or encoded merchant key.
+func TestEasyPayQueryRedirectErrorRedactsCredentials(t *testing.T) {
+	t.Parallel()
+	for _, secret := range []string{"review-merchant-secret", "review +&/=?%密钥"} {
+		t.Run(secret, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", "/%zz?"+r.URL.RawQuery)
+				w.WriteHeader(http.StatusFound)
+			}))
+			// Retain this loopback endpoint through redirect parsing and diagnostic
+			// assertions, then release its listener independently of other parallel cases.
+			t.Cleanup(server.Close)
+			adapter := newTestEasyPay(t, server.URL)
+			adapter.config["pkey"] = secret
+			_, err := adapter.QueryOrder(context.Background(), "review-order")
+			assertEasyPayQueryErrorRedacted(t, err, secret)
+		})
+	}
+}
+
+// TestEasyPayQueryNestedErrorsRetainCancellation supplies wrapped request
+// failures containing credentials. Query callers can still recognize cancellation
+// and deadlines while all exposed diagnostic strings omit the merchant secret.
+func TestEasyPayQueryNestedErrorsRetainCancellation(t *testing.T) {
+	t.Parallel()
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, errors.New("connection failed")} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			t.Parallel()
+			adapter := newTestEasyPay(t, "https://merchant.invalid")
+			adapter.httpClient.Transport = easyPayQueryFailingTransport{cause: cause}
+			_, err := adapter.QueryOrder(context.Background(), "review-order")
+			assertEasyPayQueryErrorRedacted(t, err, adapter.config["pkey"])
+			if (cause == context.Canceled || cause == context.DeadlineExceeded) && !errors.Is(err, cause) {
+				t.Fatalf("query lost cancellation identity: %v", err)
+			}
+		})
+	}
+}
+
+// assertEasyPayQueryErrorRedacted requires a failure and inspects every exposed
+// wrapped error for credential text. Raw and form-encoded keys, query labels,
+// and redirect diagnostics all indicate a leaked request representation.
+func assertEasyPayQueryErrorRedacted(t *testing.T, err error, secret string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected query failure")
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		for _, unsafe := range []string{secret, url.QueryEscape(secret), "key=", "Location header"} {
+			if strings.Contains(current.Error(), unsafe) {
+				t.Fatalf("query error exposed credential-bearing diagnostics: %v", current)
+			}
+		}
+	}
+}
+
+// signedEasyPayTestNotification signs the standard fixture with the supplied
+// merchant secret. It retains every decoded field in the signed form so tests
+// can independently choose upstream confirmation responses for the same callback.
+func signedEasyPayTestNotification(e *EasyPay) string {
+	values := easyPayTestNotificationValues()
+	params := make(map[string]string, len(values))
+	for key := range values {
+		params[key] = values.Get(key)
+	}
+	values.Set("sign", easyPaySign(params, e.config["pkey"]))
+	values.Set("sign_type", signTypeMD5)
+	return values.Encode()
+}
+
+// TestEasyPayRefundOutcomeClassification sends real HTTP refund requests to
+// local success, rejection and ambiguous response fixtures. Unknown responses
+// retain their sentinel and never cause an alternative-identifier submission.
+func TestEasyPayRefundOutcomeClassification(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string // refund outcome scenario
+		body    string // upstream response body
+		status  int    // upstream HTTP status
+		outcome string // expected result classification
+	}{
+		{name: "JSON one", body: `{"code":1,"msg":"ok"}`, outcome: "success"},
+		{name: "string one", body: `{"code":"1","msg":"ok"}`, outcome: "success"},
+		{name: "JSON zero", body: `{"code":0,"msg":"退款成功"}`, outcome: "success"},
+		{name: "string zero", body: `{"code":"0","msg":"退款成功！退款金额¥10.20"}`, outcome: "success"},
+		{name: "plain amount", body: "退款成功！退款金额¥10.20", outcome: "success"},
+		{name: "plain success", body: " 退款成功！ ", outcome: "success"},
+		{name: "explicit rejection", body: `{"code":0,"msg":"退款失败，余额不足"}`, outcome: "failed"},
+		{name: "merchant balance rejection", body: `{"code":-1,"msg":"商户余额不足"}`, outcome: "failed"},
+		{name: "parameter rejection", body: `{"code":0,"msg":"参数错误"}`, outcome: "failed"},
+		{name: "permission rejection", body: `{"code":0,"msg":"权限不足"}`, outcome: "failed"},
+		{name: "Alipay system error", body: `{"code":-1,"msg":"ACQ.SYSTEM_ERROR"}`, outcome: "unknown"},
+		{name: "WeChat system error", body: `{"code":0,"msg":"SYSTEMERROR"}`, outcome: "unknown"},
+		{name: "Chinese system error", body: `{"code":0,"msg":"系统错误"}`, outcome: "unknown"},
+		{name: "generic failure", body: `{"code":0,"msg":"退款失败"}`, outcome: "unknown"},
+		{name: "unrecognized error", body: `{"code":-1,"msg":"unexpected settlement error"}`, outcome: "unknown"},
+		{name: "mixed system and business failure", body: `{"code":0,"msg":"系统错误，余额不足"}`, outcome: "unknown"},
+		{name: "contradictory system failure", body: `{"code":1,"msg":"系统异常"}`, outcome: "unknown"},
+		{name: "contradictory service failure", body: `{"code":1,"msg":"服务不可用"}`, outcome: "unknown"},
+		{name: "wrong amount", body: "退款成功！退款金额¥10.21", outcome: "unknown"},
+		{name: "JSON wrong amount", body: `{"code":1,"msg":"退款成功！退款金额¥1.20"}`, outcome: "unknown"},
+		{name: "negative success", body: "未退款成功", outcome: "unknown"},
+		{name: "application", body: "退款申请成功", outcome: "unknown"},
+		{name: "contradiction", body: `{"code":1,"msg":"退款失败"}`, outcome: "unknown"},
+		{name: "pending code one", body: `{"code":1,"msg":"退款申请成功"}`, outcome: "unknown"},
+		{name: "query failure after submission", body: `{"code":0,"msg":"退款请求已发送，查询失败"}`, outcome: "unknown"},
+		{name: "refund timeout", body: `{"code":0,"msg":"退款失败：请求超时"}`, outcome: "unknown"},
+		{name: "ambiguous zero", body: `{"code":0,"msg":"ok"}`, outcome: "unknown"},
+		{name: "rounded fractional", body: `{"code":1.000000000000000000001,"msg":"ok"}`, outcome: "unknown"},
+		{name: "ordinary operation success", body: `{"code":1,"msg":"操作成功"}`, outcome: "success"},
+		{name: "fractional", body: `{"code":1.5,"msg":"ok"}`, outcome: "unknown"},
+		{name: "missing code", body: `{"msg":"退款成功"}`, outcome: "unknown"},
+		{name: "HTML", body: "<html>退款成功</html>", outcome: "unknown"},
+		{name: "plain missing order", body: "订单不存在", outcome: "unknown"},
+		{name: "HTTP failure", body: `{"code":1}`, status: http.StatusBadGateway, outcome: "unknown"},
+		{name: "oversized success", body: "退款成功" + strings.Repeat(" ", maxEasypayResponseSize), outcome: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				if tc.status != 0 {
+					w.WriteHeader(tc.status)
+				}
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			// Each case has a separate endpoint and submission counter; release its
+			// HTTP resources after checking that ambiguous outcomes did not retry refunds.
+			t.Cleanup(server.Close)
+			e := newTestEasyPay(t, server.URL)
+			resp, err := e.Refund(context.Background(), payment.RefundRequest{OrderID: "order", TradeNo: "trade", Amount: "10.20"})
+			switch tc.outcome {
+			case "success":
+				if err != nil || resp == nil || resp.Status != payment.ProviderStatusSuccess {
+					t.Fatalf("expected success: %+v, %v", resp, err)
+				}
+			case "failed":
+				if err == nil || errors.Is(err, payment.ErrRefundOutcomeUnknown) {
+					t.Fatalf("expected rejection: %v", err)
+				}
+			case "unknown":
+				if !errors.Is(err, payment.ErrRefundOutcomeUnknown) {
+					t.Fatalf("expected unknown outcome: %v", err)
+				}
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("refund submissions = %d, want 1", calls.Load())
+			}
+		})
+	}
+}
+
+// TestEasyPayRefundInterruptedResponse holds a refund response past the client
+// deadline. The resulting unknown outcome prevents a second request using the
+// available upstream trade number after the first submission might have succeeded.
+func TestEasyPayRefundInterruptedResponse(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_ = r.ParseForm()
+		// A withheld response models an accepted external request whose completion
+		// is not observable before client cancellation closes the local test connection.
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	e := newTestEasyPay(t, server.URL)
+	e.httpClient.Timeout = time.Second
+	_, err := e.Refund(context.Background(), payment.RefundRequest{OrderID: "order", TradeNo: "trade", Amount: "10.20"})
+	if !errors.Is(err, payment.ErrRefundOutcomeUnknown) || calls.Load() != 1 {
+		t.Fatalf("interrupted refund: %v, submissions %d", err, calls.Load())
+	}
+}
+
 // TestEasyPayNotificationParameters assembles standard, custom-type and
 // free-text forms with optional extras before signing, then adds any duplicate
 // values. It checks accepted observations, rejects extra or duplicated keys
@@ -63,7 +349,6 @@ func TestEasyPayNotificationRejectsCheckoutParameters(t *testing.T) {
 func TestEasyPayNotificationParameters(t *testing.T) {
 	t.Parallel()
 
-	e := &EasyPay{config: map[string]string{"pid": "1000", "pkey": "test-merchant-secret"}}
 	tests := []struct {
 		name string // named callback structure case
 		// payType replaces the base Alipay form value when nonempty; empty uses the
@@ -82,8 +367,19 @@ func TestEasyPayNotificationParameters(t *testing.T) {
 		{name: "standard notification"},
 		{name: "wechat notification", payType: "wxpay"},
 		{name: "custom payment type", payType: "usdt_trc20"},
-		{name: "optional param", extraKey: "param", extra: "merchant=value&extra=中文"},
+		{name: "optional param", extraKey: "param", extra: "merchant-中文"},
+		{name: "unsafe param", extraKey: "param", extra: "merchant=value&extra=中文", wantError: true},
 		{name: "empty optional param", extraKey: "param"},
+		{name: "api trade number", extraKey: "api_trade_no", extra: "API123"},
+		{name: "creation time", extraKey: "addtime", extra: "2026-10-24 12:00:00"},
+		{name: "payment time", extraKey: "endtime", extra: "2026-10-24 12:00:01"},
+		{name: "buyer", extraKey: "buyer", extra: "buyer@example.com"},
+		{name: "timestamp", extraKey: "timestamp", extra: "1792800000"},
+		{name: "unsafe buyer", extraKey: "buyer", extra: "buyer&trade_status=x", wantError: true},
+		{name: "control timestamp", extraKey: "timestamp", extra: "123\t456", wantError: true},
+		{name: "duplicate extension", extraKey: "buyer", extra: "demo", duplicate: "buyer", wantError: true},
+		{name: "client IP", extraKey: "clientip", extra: "127.0.0.1", wantError: true},
+		{name: "channel", extraKey: "cid", extra: "1", wantError: true},
 		{name: "return URL", extraKey: "return_url", extra: "https://site.example.com/payment/result", wantError: true},
 		{name: "notify URL", extraKey: "notify_url", extra: "https://site.example.com/notify", wantError: true},
 		{name: "device", extraKey: "device", extra: "mobile", wantError: true},
@@ -98,6 +394,18 @@ func TestEasyPayNotificationParameters(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Query().Get("pid") != "1000" || r.URL.Query().Get("out_trade_no") != "ORDER123" {
+					t.Error("confirmation used a different merchant or order")
+				}
+				_, _ = w.Write([]byte(`{"code":1,"status":1,"money":"650.00","trade_no":"UPSTREAM123"}`))
+			}))
+			// Keep each loopback merchant alive through its parallel case and release
+			// the listener after callback verification and request-count assertions complete.
+			t.Cleanup(server.Close)
+			e := &EasyPay{config: map[string]string{"pid": "1000", "pkey": "test-merchant-secret", "apiBase": server.URL}}
 			params := map[string]string{
 				"pid": "1000", "trade_no": "UPSTREAM123", "out_trade_no": "ORDER123",
 				"type": "alipay", "name": "充值 & 套餐=10%", "money": "650.00",
@@ -129,6 +437,9 @@ func TestEasyPayNotificationParameters(t *testing.T) {
 				if err == nil || notification != nil {
 					t.Fatalf("invalid parameters accepted: notification=%+v, err=%v", notification, err)
 				}
+				if calls.Load() != 0 {
+					t.Fatal("rejected fields triggered upstream confirmation")
+				}
 				return
 			}
 			if err != nil {
@@ -144,6 +455,9 @@ func TestEasyPayNotificationParameters(t *testing.T) {
 			values.Set("money", "651.00")
 			if _, err := e.VerifyNotification(context.Background(), values.Encode(), nil); err == nil || !strings.Contains(err.Error(), "invalid signature") {
 				t.Fatalf("tampered notification: %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("confirmation count = %d, want 1", calls.Load())
 			}
 		})
 	}
@@ -203,7 +517,7 @@ func TestEasyPayNotificationRejectsInvalidFields(t *testing.T) {
 
 // TestEasyPayQueryOrderStatusMapping serves top-level, nested, numeric and
 // absent query fields from loopback endpoints. It checks textual-state
-// precedence, requested-reference retention, money and merchant query form
+// precedence, required paid references, money and merchant query form
 // values for each fixture.
 func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 	t.Parallel()
@@ -215,6 +529,7 @@ func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 		wantStatus  string  // expected core query state
 		wantTradeNo string  // expected selected trade reference
 		wantAmount  float64 // expected reported numeric money
+		wantError   bool    // expected query rejection flag
 	}{
 		{
 			name:        "top level trade success is paid",
@@ -234,7 +549,7 @@ func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 			name:        "empty trade status with paid numeric status stays pending",
 			body:        `{"code":1,"trade_status":"","status":1,"money":"12.34"}`,
 			wantStatus:  payment.ProviderStatusPending,
-			wantTradeNo: orderID,
+			wantTradeNo: "",
 			wantAmount:  12.34,
 		},
 		{
@@ -246,29 +561,31 @@ func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 		},
 		{
 			name:        "legacy numeric paid status remains compatible",
-			body:        `{"code":1,"status":1,"money":"3.21"}`,
+			body:        `{"code":"1","status":1,"money":"3.21","trade_no":"real-trade"}`,
 			wantStatus:  payment.ProviderStatusPaid,
-			wantTradeNo: orderID,
+			wantTradeNo: "real-trade",
 			wantAmount:  3.21,
 		},
 		{
 			name:        "legacy numeric non paid status is pending",
 			body:        `{"code":1,"status":0,"money":"3.21"}`,
 			wantStatus:  payment.ProviderStatusPending,
-			wantTradeNo: orderID,
+			wantTradeNo: "",
 			wantAmount:  3.21,
 		},
 		{
-			name:        "query failure with missing status is pending",
+			name:        "query business failure is rejected",
+			wantError:   true,
 			body:        `{"code":0,"msg":"订单不存在"}`,
 			wantStatus:  payment.ProviderStatusPending,
-			wantTradeNo: orderID,
+			wantTradeNo: "",
 		},
 		{
-			name:        "missing fields are pending",
+			name:        "missing fields are rejected",
+			wantError:   true,
 			body:        `{}`,
 			wantStatus:  payment.ProviderStatusPending,
-			wantTradeNo: orderID,
+			wantTradeNo: "",
 		},
 	}
 
@@ -280,6 +597,11 @@ func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Serve the fixed response for client parser assertions; handler Write
 				// errors are discarded while callers check channel results or diagnostics.
+				for _, key := range []string{"act", "pid", "key", "out_trade_no"} {
+					if r.URL.Query().Get(key) == "" {
+						t.Errorf("missing URL query parameter: %s", key)
+					}
+				}
 				if r.Method != http.MethodPost {
 					t.Errorf("method = %q, want %q", r.Method, http.MethodPost)
 				}
@@ -298,6 +620,9 @@ func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 				gotForm = make(url.Values, len(r.PostForm))
 				for key, values := range r.PostForm {
 					gotForm[key] = append([]string(nil), values...)
+					if r.URL.Query().Get(key) != r.PostForm.Get(key) {
+						t.Errorf("query/form mismatch for %s", key)
+					}
 				}
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(tt.body))
@@ -308,6 +633,12 @@ func TestEasyPayQueryOrderStatusMapping(t *testing.T) {
 
 			provider := newTestEasyPay(t, server.URL)
 			resp, err := provider.QueryOrder(context.Background(), orderID)
+			if tt.wantError {
+				if err == nil || resp != nil {
+					t.Fatalf("invalid query accepted: %+v, %v", resp, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("QueryOrder returned error: %v", err)
 			}
@@ -566,10 +897,10 @@ func TestEasyPayRefundResponseErrors(t *testing.T) {
 		body       string // served response body text
 		want       string // expected refund diagnostic fragment
 	}{
-		{name: "html response", statusCode: http.StatusOK, body: "<html>bad config</html>", want: "non-JSON response (HTTP 200): <html>bad config</html>"},
-		{name: "non json response", statusCode: http.StatusOK, body: "not json", want: "non-JSON response (HTTP 200): not json"},
-		{name: "non 2xx response", statusCode: http.StatusBadGateway, body: "bad gateway", want: "HTTP 502: bad gateway"},
-		{name: "empty response", statusCode: http.StatusOK, body: "", want: "empty response (HTTP 200): <empty>"},
+		{name: "html response", statusCode: http.StatusOK, body: "<html>bad config</html>", want: "unconfirmed (HTTP 200): <html>bad config</html>"},
+		{name: "non json response", statusCode: http.StatusOK, body: "not json", want: "unconfirmed (HTTP 200): not json"},
+		{name: "non 2xx response", statusCode: http.StatusBadGateway, body: "bad gateway", want: "HTTP 502): bad gateway"},
+		{name: "empty response", statusCode: http.StatusOK, body: "", want: "unconfirmed (HTTP 200): <empty>"},
 	}
 
 	for _, tt := range tests {

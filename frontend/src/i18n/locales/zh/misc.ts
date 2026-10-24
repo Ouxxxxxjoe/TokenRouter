@@ -704,6 +704,9 @@ export default {
       INVALID_STATUS: '当前订单状态不允许此操作',
       BALANCE_NOT_ENOUGH: '退款金额超过余额',
       REFUND_AMOUNT_EXCEEDED: '退款金额超过充值金额',
+      REFUND_RECOVERY_REQUIRED:
+        '退款结果尚未确认，请先在支付平台核实，再处理本地记录。请勿再次提交退款。',
+      REFUND_QUERY_UNSUPPORTED: '此支付渠道不支持退款状态查询，请在支付平台后台核实退款结果。',
       REFUND_FAILED: '退款失败',
       BILLING_INFO_REQUIRED: '请填写账单信息',
       BILLING_NAME_REQUIRED: '请填写账单抬头',
